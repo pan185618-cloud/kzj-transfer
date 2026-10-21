@@ -1,7 +1,7 @@
 // 跨机中转 UI — Tauri v2 global API (withGlobalTauri).
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
-const { open } = window.__TAURI__.dialog;
+const { open, save } = window.__TAURI__.dialog;
 const { getCurrentWindow, LogicalSize, PhysicalPosition, currentMonitor } = window.__TAURI__.window;
 
 const $ = (id) => document.getElementById(id);
@@ -275,6 +275,29 @@ function bubbleForFile(f, dir) {
     card.title = path;
     card.onclick = () =>
       invoke("open_file", { path }).catch((e) => logLine("error", `打开失败: ${e}`));
+    // 另存为:弹出系统保存对话框,把文件复制到用户选的位置
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "f-save-as";
+    saveBtn.textContent = "另存为";
+    saveBtn.title = "保存到其他位置";
+    saveBtn.onclick = async (e) => {
+      e.stopPropagation();
+      try {
+        const dot = (f.name || "").lastIndexOf(".");
+        const ext = dot > 0 ? f.name.slice(dot + 1) : null;
+        // 扩展名合法才加过滤器,避免对话框报错
+        const filters = /^[a-zA-Z0-9]{1,10}$/.test(ext || "")
+          ? [{ name: `${ext.toUpperCase()} 文件`, extensions: [ext] }, { name: "所有文件", extensions: ["*"] }]
+          : undefined;
+        const dst = await save({ defaultPath: f.name, filters });
+        if (!dst) return;
+        await invoke("copy_file_to", { src: path, dst });
+        logLine("save", `已另存为: ${dst}`);
+      } catch (err) {
+        logLine("error", `另存为失败: ${err}`);
+      }
+    };
+    card.appendChild(saveBtn);
   }
   return card;
 }

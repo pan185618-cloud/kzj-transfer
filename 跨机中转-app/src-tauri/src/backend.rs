@@ -1426,6 +1426,30 @@ pub async fn open_received_dir(state: State<'_, Arc<AppState>>) -> Result<(), St
     open::that_detached(&dest).map_err(|e| e.to_string())
 }
 
+/// Copy a local file to a user-chosen location (另存为). The destination is
+/// picked by the UI via the dialog plugin; this command only copies.
+#[tauri::command]
+pub async fn copy_file_to(src: String, dst: String) -> Result<(), String> {
+    let src_path = PathBuf::from(&src);
+    if !src_path.is_file() {
+        return Err("源文件不存在".to_string());
+    }
+    let dst_path = PathBuf::from(&dst);
+    if dst_path == src_path {
+        return Ok(());
+    }
+    if let Some(parent) = dst_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    tokio::task::spawn_blocking(move || std::fs::copy(&src_path, &dst_path).map(|_| ()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("复制失败: {e}"))?;
+    Ok(())
+}
+
 /// Open a received file with the system default app.
 #[tauri::command]
 pub async fn open_file(path: String) -> Result<(), String> {

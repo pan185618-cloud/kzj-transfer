@@ -22,6 +22,7 @@ pub fn run() {
             backend::refresh_devices,
             backend::add_device_ip,
             backend::open_received_dir,
+            backend::copy_file_to,
             backend::open_file,
             backend::read_image_preview,
             backend::open_link,

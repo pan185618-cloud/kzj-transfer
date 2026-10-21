@@ -261,6 +261,15 @@ dialog button { border: 1px solid #e5e6eb; background: #fff; border-radius: 6px;
 .f-card.openable { cursor: pointer; }
 .f-card.openable:hover .f-name { color: #165dff; text-decoration: underline; }
 
+/* 另存为小按钮 */
+.f-card .f-save-as {
+  border: none; background: transparent; color: #86909c;
+  font-size: 11px; cursor: pointer; padding: 3px 7px; border-radius: 5px;
+  flex-shrink: 0;
+}
+.f-card .f-save-as:hover { color: #165dff; background: rgba(22, 93, 255, .08); }
+.f-card.has-thumb .f-save-as { align-self: flex-end; }
+
 /* 图片缩略图:有图时卡片改为上下布局,图在上 */
 .f-card.has-thumb { flex-direction: column; align-items: stretch; gap: 6px; }
 .f-thumb {
