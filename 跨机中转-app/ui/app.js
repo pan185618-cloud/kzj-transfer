@@ -16,6 +16,8 @@ let islandText = "中转";
 // 消息历史: fingerprint -> [{dir,kind,text,files,sessionId,sendId,ts,state,ratio}]
 const history = new Map();
 let typeView = false; // 按类型分类显示模式
+let pendingPaths = null; // 拖拽进来但还没选设备时暂存的路径
+let dragDepth = 0;       // 拖拽悬停计数,避免在子元素间移动时闪烁
 
 function fmtBytes(n) {
   if (n < 1024) return `${n} B`;
@@ -70,6 +72,12 @@ function selectDevice(fp) {
   typeView = false;
   renderDeviceBar();
   renderMessages();
+  // 若拖拽进来的文件还在等选设备,选定后自动发出
+  if (pendingPaths && pendingPaths.length) {
+    const paths = pendingPaths;
+    pendingPaths = null;
+    sendPaths(paths);
+  }
 }
 
 function hasMessages() {
@@ -344,25 +352,69 @@ $("composer-input").addEventListener("input", autosize);
 // 粘贴:若内容是纯链接也直接可发(已是文本),无需特殊处理;这里做体验优化:含链接时提示 🔗
 $("composer-input").addEventListener("paste", () => setTimeout(autosize, 0));
 
-// 📎 发文件
-$("btn-attach").onclick = async () => {
+// 统一发送入口:文件 / 照片 / 文件夹的路径数组 → 发给当前选中设备。
+// 未选设备时:只有一台在线设备则自动选中;否则暂存路径,等用户选定设备后自动发出。
+async function sendPaths(paths) {
+  if (!paths || paths.length === 0) return;
   if (!selectedFingerprint) {
     if (devices.length === 1) {
       selectDevice(devices[0].fingerprint);
     } else {
-      logLine("send", "请先在顶部选择目标设备");
+      pendingPaths = paths;
+      logLine("send", "请先在顶部选择目标设备(已暂存待发送的文件)");
       $("device-hint").classList.remove("hidden");
       return;
     }
   }
-  const sel = await open({ multiple: true, directory: false });
-  if (!sel || sel.length === 0) return;
   try {
-    await invoke("send_files", { fingerprint: selectedFingerprint, paths: sel });
+    await invoke("send_files", { fingerprint: selectedFingerprint, paths });
   } catch (err) {
     logLine("send", `发送失败: ${err}`);
   }
+}
+
+// 📎 发文件(不传 filters = 全部类型:图片/视频/文档/压缩包等)
+$("btn-attach").onclick = async () => {
+  const sel = await open({ multiple: true, directory: false });
+  if (!sel || sel.length === 0) return;
+  sendPaths(Array.isArray(sel) ? sel : [sel]);
 };
+
+// 📁 发整个文件夹(自动递归里面所有文件)
+$("btn-attach-dir").onclick = async () => {
+  const sel = await open({ directory: true, multiple: true });
+  if (!sel || sel.length === 0) return;
+  sendPaths(Array.isArray(sel) ? sel : [sel]);
+};
+
+// ---------- 拖拽传输:文件 / 照片 / 文件夹 直接拖进窗口 ----------
+
+// 阻止浏览器默认行为(否则拖进来会在窗口里直接打开文件)
+document.addEventListener("dragover", (e) => e.preventDefault());
+document.addEventListener("drop", (e) => e.preventDefault());
+
+// 悬停高亮(计数器避免在子元素间移动时闪烁)
+document.addEventListener("dragenter", (e) => {
+  e.preventDefault();
+  if (e.dataTransfer && Array.from(e.dataTransfer.types).includes("Files")) {
+    dragDepth++;
+    $("stage").classList.add("drag-over");
+  }
+});
+document.addEventListener("dragleave", (e) => {
+  e.preventDefault();
+  if (dragDepth > 0) dragDepth--;
+  if (dragDepth === 0) $("stage").classList.remove("drag-over");
+});
+
+// Tauri 原生拖放事件:拿到真实路径,文件和文件夹都支持
+listen("tauri://drag-drop", (e) => {
+  dragDepth = 0;
+  $("stage").classList.remove("drag-over");
+  const paths = (e.payload && e.payload.paths) || [];
+  if (!paths.length) return;
+  sendPaths(paths);
+});
 
 // 🔗 本机打开输入中的链接(不发送)
 $("composer-open-link").onclick = async () => {

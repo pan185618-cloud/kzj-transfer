@@ -98,6 +98,14 @@ body {
   gap: 10px;
 }
 
+/* 拖拽悬停高亮 */
+#stage.drag-over {
+  outline: 2px dashed #2f54eb;
+  outline-offset: -6px;
+  background: #f0f5ff;
+  border-radius: 8px;
+}
+
 .empty-hint {
   margin: auto;
   text-align: center;

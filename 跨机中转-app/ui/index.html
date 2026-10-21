@@ -39,7 +39,7 @@
     <div id="empty-hint" class="empty-hint">
       <div class="big">⇄</div>
       <div>还没有内容</div>
-      <div class="sub">顶部选一台设备;在下方输入框粘贴文本/链接发送,或点 📎 发文件</div>
+      <div class="sub">顶部选一台设备;输入文本发送,点 📎 发文件、📁 发文件夹;也可以直接把文件/照片/文件夹拖进窗口</div>
     </div>
     <div id="device-hint" class="empty-hint hidden">
       <div class="big">📡</div>
@@ -52,7 +52,8 @@
 
   <!-- 底部:输入框 -->
   <footer id="composer">
-    <button id="btn-attach" class="c-btn icon" title="发送文件">📎</button>
+    <button id="btn-attach" class="c-btn icon" title="发送文件(全部类型)">📎</button>
+    <button id="btn-attach-dir" class="c-btn icon" title="发送整个文件夹">📁</button>
     <textarea id="composer-input" rows="1" placeholder="输入文本或粘贴链接,Enter 发送,Shift+Enter 换行"></textarea>
     <button id="composer-open-link" class="c-btn icon" title="本机打开输入中的链接,不发送">🔗</button>
     <button id="composer-send" class="c-btn primary" title="发送">➤</button>
