@@ -1,6 +1,7 @@
-# 跨机中转 (kzjj-transfer)
+# 跨机中转 (kzj-transfer)
 
-局域网文件/文本/链接互传 App —— Tauri v2 桌面应用,基于 [LocalSend](https://github.com/localsend/localsend) 二次开发。
+局域网文件/文本/链接互传 App —— Tauri v2 桌面应用(Windows / macOS),基于
+[LocalSend](https://github.com/localsend/localsend) 协议核心二次开发。
 
 ## 功能
 
@@ -14,50 +15,67 @@
 ## 仓库结构
 
 ```
-跨机中转/
-├── app/                  # LocalSend 上游源码 (作为 git submodule / 独立 clone)
-│   └── packages/core     # localsend Rust crate,backend 引用
+kzj-transfer/
+├── app/                  # LocalSend 上游源码(独立 clone,不入库;见下)
+│   └── packages/core     # localsend Rust crate,backend 通过 path 依赖引用
 ├── 跨机中转-app/          # 这个 Tauri 应用
 │   ├── src-tauri/        # Rust 后端:发现/收发/配对/事件桥
 │   └── ui/               # 无打包器的 HTML/CSS/JS (withGlobalTauri)
-└── 使用说明.md
+├── README.md             # 本文件:构建说明
+└── 使用说明.md           # 软件使用说明
 ```
 
-## 构建前置
+## 构建(通用步骤)
 
-1. 把 [LocalSend](https://github.com/localsend/localsend) clone 到本仓库的 `app/` 目录(与 `跨机中转-app/` 同级):
-   ```bash
-   git clone https://github.com/localsend/localsend.git app
-   ```
-   **必须** 是 `app/packages/core` 这个 cargo crate 可见 —— 跨机中转-app 的 `src-tauri/Cargo.toml` 通过 `path = "../../app/packages/core"` 引用它。
-
-2. 安装依赖:
-   - Rust toolchain(`cargo`)
-   - Node.js + npm(用于 `tauri` CLI)
-   - macOS 上 `iconutil`(系统自带)、ImageMagick(可选,改图标用)
-
-## 构建 / 运行
+`app/` 是上游 LocalSend 仓库,不收进本仓库版本控制,构建前单独 clone
+(与 `跨机中转-app/` 同级,目录名必须是 `app`):
 
 ```bash
-cd 跨机中转-app
-npm install
-npm run tauri build     # 打包 release
-npm run tauri dev       # 开发模式
-```
-
-打包产物在 `跨机中转-app/src-tauri/target/release/bundle/`。
-
-## Windows 端
-
-`app` 目录在上游仓库是 git 仓库,所以这边没有把它收进版本控制。Windows 上同步方式:
-
-```powershell
-git clone <这个仓库的 URL> 跨机中转
-cd 跨机中转
+git clone https://github.com/pan185618-cloud/kzj-transfer.git
+cd kzj-transfer
 git clone https://github.com/localsend/localsend.git app
 cd 跨机中转-app
 npm install
 npm run tauri build
 ```
 
-详见 `跨机中转-app/打包-Windows.md`。
+`src-tauri/Cargo.toml` 通过 `path = "../../app/packages/core"` 引用核心库,
+目录结构必须保持 `跨机中转-app/` 与 `app/` 互为兄弟目录。
+
+产物在 `跨机中转-app/src-tauri/target/release/`:
+
+- Windows:`bundle\nsis\跨机中转_0.1.0_x64-setup.exe`(推荐分发)、
+  `bundle\msi\跨机中转_0.1.0_x64_zh-CN.msi`、`kuajizhongzhuan.exe`(免安装)
+- macOS:`bundle/dmg/`(拖入 Applications 即用)
+
+### Windows 前置环境(一次性)
+
+1. **Visual Studio Build Tools(MSVC,必需)** —
+   `winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`
+   (必须勾选「使用 C++ 的桌面开发」,提供 link.exe 和 Windows SDK)
+2. **Rust(MSVC 工具链)** — `winget install --id Rustlang.Rustup`
+3. **Node.js LTS** — `winget install --id OpenJS.NodeJS.LTS`
+
+首次编译几百个 crate 约 10–25 分钟;`npx tauri build` 中途的 crate 下载慢可配
+cargo 镜像源。
+
+### macOS 前置环境
+
+Xcode Command Line Tools(`xcode-select --install`)+ Rust + Node.js。
+图标调整用到系统自带 `iconutil`,ImageMagick 可选。
+
+## 首次运行注意
+
+- **Windows 防火墙弹窗务必「允许访问」(勾选专用网络)**:局域网发现靠 UDP
+  组播,入站传输靠 TCP 53317,被拦就互相搜不到设备。
+- 接收文件默认存到「下载」目录,可在 ⚙ 设置里改。
+- 两台设备须在同一局域网(Wi-Fi / 热点);搜不到时用「+ IP」手动添加对方 IP。
+
+## 开发模式
+
+```bash
+cd 跨机中转-app
+npm run tauri dev
+```
+
+详见 `跨机中转-app/打包-Windows.md`(Windows 构建细节与排错)。

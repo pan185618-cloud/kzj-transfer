@@ -39,6 +39,9 @@
       "minimumSystemVersion": "10.15"
     },
     "windows": {
+      "wix": {
+        "language": "zh-CN"
+      },
       "nsis": {
         "installMode": "perMachine"
       }
