@@ -3,6 +3,7 @@
 //! events for the UI.
 
 use crate::events::*;
+use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use localsend::discovery::{
@@ -198,6 +199,9 @@ struct SendTask {
     kind: &'static str,
     /// For kind=text: the message preview.
     text_preview: Option<String>,
+    /// For kind=files: per-file payloads (saved_path = local source path)
+    /// emitted with every progress event so the UI can preview files.
+    files_payload: Vec<FilePayload>,
     total_bytes: u64,
     sent: Arc<AtomicU64>,
     cancel_token: CancellationToken,
@@ -873,6 +877,7 @@ async fn run_send(
                     fingerprint: task.fingerprint.clone(),
                     kind: task.kind.to_string(),
                     text_preview: task.text_preview.clone(),
+                    files: task.files_payload.clone(),
                 },
             );
         }};
@@ -896,6 +901,7 @@ async fn run_send(
                     fingerprint: task.fingerprint.clone(),
                     kind: task.kind.to_string(),
                     text_preview: task.text_preview.clone(),
+                    files: task.files_payload.clone(),
                 },
             );
         }
@@ -1016,6 +1022,7 @@ async fn run_send(
         let fp2 = task.fingerprint.clone();
         let kind2 = task.kind;
         let tp2 = task.text_preview.clone();
+        let files2 = task.files_payload.clone();
         let mut sent_of_file = 0u64;
         let stream = content.into_stream().map(move |chunk| {
             let chunk = chunk?;
@@ -1036,6 +1043,7 @@ async fn run_send(
                     fingerprint: fp2.clone(),
                     kind: kind2.to_string(),
                     text_preview: tp2.clone(),
+                    files: files2.clone(),
                 },
             );
             Ok::<Bytes, anyhow::Error>(chunk)
@@ -1152,6 +1160,23 @@ pub async fn send_files(
     if files.is_empty() {
         return Err("没有可发送的文件".to_string());
     }
+    // Per-file payload for the UI: saved_path = local source path so sent
+    // images can be previewed and reopened from the chat bubble.
+    let mut files_payload: Vec<FilePayload> = files
+        .values()
+        .map(|f| FilePayload {
+            id: f.id.clone(),
+            name: f.file_name.clone(),
+            size: f.size,
+            file_type: f.file_type.clone(),
+            preview: f.preview.clone(),
+            saved_path: sources.get(&f.id).and_then(|s| match s {
+                FileSource::Path(p) => Some(p.display().to_string()),
+                FileSource::Bytes(_) => None,
+            }),
+        })
+        .collect();
+    files_payload.sort_by(|a, b| a.name.cmp(&b.name));
     let send_id = uuid::Uuid::new_v4().to_string();
     let task = Arc::new(SendTask {
         send_id: send_id.clone(),
@@ -1159,6 +1184,7 @@ pub async fn send_files(
         fingerprint: device.device.fingerprint.clone(),
         kind: "files",
         text_preview: None,
+        files_payload,
         total_bytes,
         sent: Arc::new(AtomicU64::new(0)),
         cancel_token: CancellationToken::new(),
@@ -1223,6 +1249,7 @@ pub async fn send_text(
         fingerprint: device.device.fingerprint.clone(),
         kind: "text",
         text_preview: Some(preview.clone()),
+        files_payload: vec![],
         total_bytes: size,
         sent: Arc::new(AtomicU64::new(0)),
         cancel_token: CancellationToken::new(),
@@ -1407,6 +1434,35 @@ pub async fn open_file(path: String) -> Result<(), String> {
         return Err("文件不存在".to_string());
     }
     open::that_detached(&p).map_err(|e| e.to_string())
+}
+
+/// Read a local image file and return a data URL for inline preview.
+/// Only image/* files under ~20MB are served; anything else errors out.
+#[tauri::command]
+pub async fn read_image_preview(path: String) -> Result<String, String> {
+    const MAX_BYTES: u64 = 20 * 1024 * 1024;
+    let p = PathBuf::from(&path);
+    if !p.is_file() {
+        return Err("文件不存在".to_string());
+    }
+    let mime = mime_guess::from_path(&p)
+        .first_raw()
+        .unwrap_or_default()
+        .to_string();
+    if !mime.starts_with("image/") {
+        return Err("不是图片文件".to_string());
+    }
+    let meta = std::fs::metadata(&p).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_BYTES {
+        return Err("图片过大,无法预览".to_string());
+    }
+    let bytes =
+        tokio::task::spawn_blocking(move || std::fs::read(p))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e: std::io::Error| e.to_string())?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
 }
 
 /// Open a link in the default browser (本机打开,不中转).

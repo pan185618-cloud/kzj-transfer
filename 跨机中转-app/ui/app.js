@@ -166,9 +166,35 @@ function bubbleForFile(f, dir) {
   sub.className = "f-sub";
   sub.textContent = fmtBytes(f.size || 0);
   info.append(name, sub);
-  card.append(icon, info);
   const path = f.savedPath || f.saved_path;
-  if (dir === "in" && path) {
+  const isImage = (f.fileType || f.file_type || "").toLowerCase().startsWith("image/");
+  // 图片:在气泡里直接显示缩略图(懒加载,失败回落到图标)
+  if (isImage && path) {
+    card.classList.add("has-thumb");
+    const thumb = document.createElement("img");
+    thumb.className = "f-thumb";
+    thumb.alt = f.name || "";
+    thumb.loading = "lazy";
+    thumb.onerror = () => {
+      thumb.remove();
+      card.classList.remove("has-thumb");
+      card.prepend(icon);
+    };
+    invoke("read_image_preview", { path })
+      .then((url) => {
+        thumb.src = url;
+        card.prepend(thumb);
+      })
+      .catch(() => {
+        thumb.remove();
+        card.classList.remove("has-thumb");
+        card.prepend(icon);
+      });
+    card.append(info);
+  } else {
+    card.append(icon, info);
+  }
+  if (path) {
     card.classList.add("openable");
     card.title = path;
     card.onclick = () =>
@@ -638,6 +664,10 @@ listen("send-progress", (e) => {
   const zh = { sending: "发送中", done: "完成", failed: "失败", cancelled: "已取消" }[p.state] || p.state;
   const msgs = history.get(p.fingerprint) || [];
   const existing = msgs.find((x) => x._key === key);
+  const files = (p.files || []).map((f) => ({
+    id: f.id, name: f.name, size: f.size,
+    fileType: f.fileType, savedPath: f.savedPath,
+  }));
   const patch = {
     ratio,
     state: p.state,
@@ -646,6 +676,7 @@ listen("send-progress", (e) => {
     cancellable: p.state === "sending",
     onCancel: () => invoke("cancel_send", { sendId: p.sendId }).catch(() => {}),
   };
+  if (files.length) patch.files = files;
   if (existing) {
     Object.assign(existing, patch);
     renderMessages();
@@ -665,7 +696,7 @@ listen("send-progress", (e) => {
   } else {
     pushMsg(p.fingerprint, {
       _key: key, dir: "out", kind: "files", alias: p.alias,
-      files: [], ts: Date.now(), ...patch,
+      files, ts: Date.now(), ...patch,
     });
   }
   islandText = `⬆ ${p.alias} ${p.state === "sending" ? Math.round(ratio * 100) + "%" : zh}`;

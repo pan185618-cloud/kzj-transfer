@@ -23,6 +23,7 @@ pub fn run() {
             backend::add_device_ip,
             backend::open_received_dir,
             backend::open_file,
+            backend::read_image_preview,
             backend::open_link,
         ])
         .run(tauri::generate_context!())

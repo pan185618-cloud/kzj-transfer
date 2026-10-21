@@ -261,6 +261,19 @@ dialog button { border: 1px solid #e5e6eb; background: #fff; border-radius: 6px;
 .f-card.openable { cursor: pointer; }
 .f-card.openable:hover .f-name { color: #165dff; text-decoration: underline; }
 
+/* 图片缩略图:有图时卡片改为上下布局,图在上 */
+.f-card.has-thumb { flex-direction: column; align-items: stretch; gap: 6px; }
+.f-thumb {
+  display: block;
+  max-width: 240px;
+  max-height: 180px;
+  width: auto; height: auto;
+  border-radius: 8px;
+  object-fit: cover;
+  background: #f2f3f5;
+}
+.msg.out .f-thumb { background: #c3d4f8; }
+
 .msg .bar { margin-top: 6px; }
 .msg .t-status { font-size: 11px; margin-top: 4px; }
 .msg.out .t-status { color: #5b6b8c; }

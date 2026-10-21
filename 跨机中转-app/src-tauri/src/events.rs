@@ -150,4 +150,7 @@ pub struct SendProgressPayload {
     pub kind: String,
     /// For kind=text: the message preview.
     pub text_preview: Option<String>,
+    /// For kind=files: per-file details; saved_path = local source path,
+    /// so the UI can preview/ reopen what it sent.
+    pub files: Vec<FilePayload>,
 }
