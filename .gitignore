@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+
+# Rust / Tauri / Node build output
+**/target/
+**/node_modules/
+**/dist/
+**/dist-ssr/
+
+# Icon working dir (icon.icns kept)
+跨机中转-app/src-tauri/icons/icon.iconset/
+
+# Local secrets / logs
+*.log
+.env
+.env.local
+
+# LocalSend upstream's own artifacts
+app/.dart_tool/
+app/build/
+app/.flutter-plugins*
+app/.metadata
+
+# 上游 LocalSend 源码(在远端仓库单独 clone,作为 git submodule 或独立仓库)
+app/
+# 分发的二进制/zip
+分发包/
+跨机中转-cli
+**/build/

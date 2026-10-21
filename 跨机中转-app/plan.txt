@@ -1,0 +1,6 @@
+架构：
+- src-tauri: Rust backend, embed localsend core (path dep ../app/packages/core)
+- 复用 cli crate 的 Network + headless 事件循环逻辑，把 crossterm Ui 换成 tauri::Emitter 推到前端
+- ui/: 静态 HTML+JS，无构建步骤（先 vanilla，之后可换框架）
+- tauri.conf.json: frontendDist ../ui
+- 编译: cargo tauri build → .app bundle 不需要 xcodebuild

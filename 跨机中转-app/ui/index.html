@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>跨机中转</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 顶部:设备栏 -->
+  <header class="toolbar">
+    <span class="brand">中转</span>
+    <div id="device-bar" class="device-bar" data-tauri-drag-region>
+      <button id="chip-all" class="chip active">全部</button>
+      <button id="chip-type" class="chip" title="按文件类型归类查看">按类型</button>
+      <!-- 设备 chip 由 JS 插入 -->
+      <button id="chip-add" class="chip ghost-chip" title="手动添加设备 IP">+ IP</button>
+    </div>
+    <span class="spacer"></span>
+    <div class="tb-group">
+      <button id="btn-refresh" class="tb-btn icon" title="重新发现设备">↻</button>
+      <button id="btn-open-dir" class="tb-btn icon" title="打开接收目录">📁</button>
+      <button id="btn-settings" class="tb-btn icon" title="设置">⚙</button>
+      <button id="btn-compact" class="tb-btn" title="收纳到小窗">收纳</button>
+    </div>
+  </header>
+
+  <!-- 手动添加 IP 弹层 -->
+  <div id="ip-pop" class="popover hidden">
+    <div class="pop-title">手动添加设备</div>
+    <div class="add-ip">
+      <input id="ip-input" type="text" placeholder="设备 IP,如 192.168.100.x">
+      <button id="btn-add-ip" class="ghost">添加</button>
+    </div>
+  </div>
+
+  <!-- 中间:会话区 -->
+  <main id="stage">
+    <div id="empty-hint" class="empty-hint">
+      <div class="big">⇄</div>
+      <div>还没有内容</div>
+      <div class="sub">顶部选一台设备;在下方输入框粘贴文本/链接发送,或点 📎 发文件</div>
+    </div>
+    <div id="device-hint" class="empty-hint hidden">
+      <div class="big">📡</div>
+      <div>没有发现设备</div>
+      <div class="sub">请先在顶部选择一台在线设备,或用 + IP 手动添加</div>
+    </div>
+    <ul id="msg-list" class="msg-list"></ul>
+    <div id="log" class="log"></div>
+  </main>
+
+  <!-- 底部:输入框 -->
+  <footer id="composer">
+    <button id="btn-attach" class="c-btn icon" title="发送文件">📎</button>
+    <textarea id="composer-input" rows="1" placeholder="输入文本或粘贴链接,Enter 发送,Shift+Enter 换行"></textarea>
+    <button id="composer-open-link" class="c-btn icon" title="本机打开输入中的链接,不发送">🔗</button>
+    <button id="composer-send" class="c-btn primary" title="发送">➤</button>
+  </footer>
+
+  <!-- 灵动岛小窗模式 -->
+  <div id="island" class="hidden" data-tauri-drag-region>
+    <span id="island-status">中转</span>
+    <button id="island-expand" title="展开">⤢</button>
+  </div>
+
+  <!-- 接收请求弹窗 -->
+  <dialog id="receive-dialog">
+    <h3 id="req-title">接收请求</h3>
+    <ul id="req-files" class="req-files"></ul>
+    <div class="dialog-actions">
+      <button id="req-accept" class="primary">接收</button>
+      <button id="req-pair">接收并配对</button>
+      <button id="req-decline" class="danger">拒绝</button>
+    </div>
+  </dialog>
+
+  <!-- 设置弹窗 -->
+  <dialog id="settings-dialog">
+    <h3>设置</h3>
+    <label>设备名 <input id="set-alias" type="text"></label>
+    <label class="dest-row">接收目录
+      <span class="dest-input">
+        <input id="set-dest" type="text">
+        <button id="set-browse" class="ghost" type="button">浏览…</button>
+      </span>
+    </label>
+    <div class="dialog-actions">
+      <button id="set-save" class="primary">保存</button>
+      <button id="set-close">关闭</button>
+    </div>
+    <p class="hint">设备名保存后重启应用生效。指纹: <code id="set-fp"></code></p>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
