@@ -1430,7 +1430,7 @@ pub async fn open_received_dir(state: State<'_, Arc<AppState>>) -> Result<(), St
 #[tauri::command]
 pub async fn open_file(path: String) -> Result<(), String> {
     let p = PathBuf::from(&path);
-    if !p.is_file() {
+    if !p.exists() {
         return Err("文件不存在".to_string());
     }
     open::that_detached(&p).map_err(|e| e.to_string())

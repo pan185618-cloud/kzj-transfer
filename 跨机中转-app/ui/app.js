@@ -151,6 +151,82 @@ function typeGroup(f) {
   return tag;
 }
 
+// ---------- 文件夹分组显示 ----------
+// name 形如 "目录名/子路径/文件"(来自 collect_path 的 strip_prefix):
+// 第一段是顶层目录名 → 该文件归入这个文件夹组;不带 "/" 的是顶层散文件。
+
+function isFolderMsg(m) {
+  return m.kind === "files" && (m.files || []).some((f) => (f.name || "").includes("/"));
+}
+
+// 按第一段路径分组,保持文件原有顺序
+function groupByFolder(files) {
+  const groups = [];
+  const byName = new Map();
+  for (const f of files || []) {
+    const seg = (f.name || "").split("/")[0] || f.name;
+    if ((f.name || "").includes("/")) {
+      if (!byName.has(seg)) {
+        const g = { name: seg, files: [], size: 0, dirPath: null };
+        byName.set(seg, g);
+        groups.push(g);
+      }
+      const g = byName.get(seg);
+      g.files.push(f);
+      g.size += f.size || 0;
+      if (!g.dirPath) {
+        const p = f.savedPath || f.saved_path || "";
+        const idx = p.indexOf("/" + seg + "/");
+        if (idx >= 0) g.dirPath = p.slice(0, idx + seg.length + 1);
+      }
+    } else {
+      groups.push({ name: null, files: [f], size: f.size || 0, dirPath: null });
+    }
+  }
+  return groups;
+}
+
+// 文件夹卡片:📁 文件夹名 + N 个文件/总大小,点击打开文件夹;
+// 下方缩进列出组内文件(相对路径),单击仍可打开单个文件。
+function bubbleForFolder(g, dir) {
+  const wrap = document.createElement("div");
+  wrap.className = "f-folder";
+
+  const head = document.createElement("div");
+  head.className = "f-card f-folder-head";
+  const icon = document.createElement("span");
+  icon.className = "f-icon";
+  icon.textContent = "📁";
+  const info = document.createElement("div");
+  info.className = "f-info";
+  const name = document.createElement("div");
+  name.className = "f-name";
+  name.textContent = `[文件夹] ${g.name}`;
+  const sub = document.createElement("div");
+  sub.className = "f-sub";
+  sub.textContent = `${g.files.length} 个文件 · ${fmtBytes(g.size)}`;
+  info.append(name, sub);
+  head.append(icon, info);
+  if (g.dirPath) {
+    head.classList.add("openable");
+    head.title = g.dirPath;
+    head.onclick = () =>
+      invoke("open_file", { path: g.dirPath }).catch((e) => logLine("error", `打开失败: ${e}`));
+  }
+  wrap.appendChild(head);
+
+  const list = document.createElement("div");
+  list.className = "f-folder-items";
+  for (const f of g.files) {
+    const rel = { ...f, name: f.name.slice(g.name.length + 1) };
+    const item = bubbleForFile(rel, dir);
+    item.classList.add("f-subitem");
+    list.appendChild(item);
+  }
+  wrap.appendChild(list);
+  return wrap;
+}
+
 function bubbleForFile(f, dir) {
   const card = document.createElement("div");
   card.className = "f-card";
@@ -217,6 +293,10 @@ function msgNode(m) {
 
   if (m.kind === "text") {
     bubble.appendChild(linkify(m.text));
+  } else if (isFolderMsg(m)) {
+    for (const g of groupByFolder(m.files)) {
+      bubble.appendChild(g.name === null ? bubbleForFile(g.files[0], m.dir) : bubbleForFolder(g, m.dir));
+    }
   } else {
     for (const f of m.files || []) bubble.appendChild(bubbleForFile(f, m.dir));
   }

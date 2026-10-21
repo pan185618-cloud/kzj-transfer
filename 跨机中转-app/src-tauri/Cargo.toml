@@ -30,3 +30,9 @@ open = "5"
 
 [dev-dependencies]
 tauri = { version = "2", features = ["devtools"] }
+
+# macOS: vendored wry 0.57.0 + upstream fix (tauri-apps/wry#1844) so folder drops
+# publish file URLs via readObjectsForClasses:options: instead of only the
+# legacy NSFilenamesPboardType. Windows/Linux resolve wry from crates.io as usual.
+[patch.crates-io]
+wry = { path = "vendor/wry" }
