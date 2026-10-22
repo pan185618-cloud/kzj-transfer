@@ -568,7 +568,12 @@ listen("tauri://drag-leave", () => {
 listen("tauri://drag-drop", (e) => {
   $("stage").classList.remove("drag-over");
   const paths = (e.payload && e.payload.paths) || [];
-  if (!paths.length) return;
+  if (!paths.length) {
+    // macOS 某些拖拽源(如从 Finder 的「快速查看」、归档工具的预览窗格、
+    // 网页图片)只给出非文件 URL,wry 解不出路径——不静默吞掉,提示用户。
+    logLine("error", "拖拽的内容未识别到文件路径,请改用 📎 选择文件,或从 Finder 中拖动");
+    return;
+  }
   sendPaths(paths);
 });
 

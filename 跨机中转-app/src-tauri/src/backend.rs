@@ -225,6 +225,32 @@ pub struct AppState {
     paired: Mutex<HashSet<String>>,
 }
 
+/// reqwest::Error's Display only prints the top-level
+/// "error sending request for url" — the real reason
+/// (证书指纹不匹配 / 连接被拒 / 超时) sits in the source chain.
+fn reqwest_error_detail(err: &ClientError) -> String {
+    // Walk the chain so the TLS reject reason buried under
+    // "error sending request" reaches the user.
+    let mut detail = err.to_string();
+    let mut src = std::error::Error::source(err);
+    let mut depth = 0;
+    while let Some(e) = src {
+        let s = e.to_string();
+        if !detail.contains(&s) {
+            detail.push_str(&format!(": {s}"));
+        }
+        src = e.source();
+        depth += 1;
+        if depth >= 8 {
+            break;
+        }
+    }
+    if detail.contains("fingerprint mismatch") {
+        detail.push_str("(对方设备指纹已变化,可能是重装或发现了同名的旧设备,请让对方重新在线)");
+    }
+    detail
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -907,64 +933,117 @@ async fn run_send(
         }
     };
 
-    let Some(http) = device.get_best_channel().and_then(|c| c.http()) else {
+    // Try every known address of the device, best-ranked first: a peer that
+    // moved to a new IP keeps its stale channels listed as Available (nothing
+    // in core ever marks a channel NotReachable), so the first address may be
+    // dead. Only transport-level failures (unreachable host, TLS reject)
+    // fall through to the next address — a StatusCode answer means the peer
+    // itself decided, retrying another address of the same peer changes
+    // nothing, and a fingerprint mismatch would fail identically everywhere.
+    let channels: Vec<HttpChannel> = device
+        .get_ranked_channels()
+        .into_iter()
+        .filter_map(|c| c.http().cloned())
+        .collect();
+    if channels.is_empty() {
         fail(format!("{alias}: 没有可用地址")).await;
         return;
-    };
-    let protocol = http.protocol.clone();
-    let expected_fingerprint = match protocol {
-        ProtocolType::Https => Some(device.device.fingerprint.clone()),
-        ProtocolType::Http => None,
-    };
-    let client = match LsHttpClientV2::try_new(
-        &state.identity.key_pem,
-        &state.identity.cert_pem,
-        expected_fingerprint,
-        None,
-    ) {
-        Ok(c) => c,
-        Err(err) => {
-            fail(format!("{alias}: HTTP client 创建失败: {err}")).await;
-            return;
-        }
-    };
+    }
 
+    let expected_fingerprint = Some(device.device.fingerprint.clone());
     let is_message = files.len() == 1 && files.values().all(|f| f.preview.is_some());
-    let prepared = match client
-        .prepare_upload(
-            protocol.clone(),
-            &http.host,
-            http.port,
+
+    let mut client = None;
+    let mut http = None;
+    let mut protocol = ProtocolType::Http;
+    let mut prepared = None;
+    let mut last_err: Option<ClientError> = None;
+    let total_channels = channels.len();
+    for (idx, channel) in channels.into_iter().enumerate() {
+        protocol = channel.protocol.clone();
+        let expected = match protocol {
+            ProtocolType::Https => expected_fingerprint.clone(),
+            ProtocolType::Http => None,
+        };
+        let c = match LsHttpClientV2::try_new(
+            &state.identity.key_pem,
+            &state.identity.cert_pem,
+            expected,
             None,
-            PrepareUploadRequestDtoV2 {
-                info: state.identity.register_dto(),
-                files: files.clone(),
-            },
-            None,
-            task.cancel_token.clone(),
-        )
-        .await
-    {
-        Ok(p) => p,
-        Err(ClientError::Cancelled) => {
-            progress!("cancelled", None);
-            return;
+        ) {
+            Ok(c) => c,
+            Err(err) => {
+                fail(format!("{alias}: HTTP client 创建失败: {err}")).await;
+                return;
+            }
+        };
+        match c
+            .prepare_upload(
+                protocol.clone(),
+                &channel.host,
+                channel.port,
+                None,
+                PrepareUploadRequestDtoV2 {
+                    info: state.identity.register_dto(),
+                    files: files.clone(),
+                },
+                None,
+                task.cancel_token.clone(),
+            )
+            .await
+        {
+            Ok(p) => {
+                client = Some(c);
+                http = Some(channel);
+                prepared = Some(p);
+                break;
+            }
+            Err(ClientError::Cancelled) => {
+                progress!("cancelled", None);
+                return;
+            }
+            Err(ClientError::StatusCode(err)) => {
+                let reason = match err.status {
+                    401 => "需要 PIN 码".to_string(),
+                    403 => "对方拒绝了".to_string(),
+                    409 => "对方正忙(另一会话进行中)".to_string(),
+                    429 => "请求太频繁".to_string(),
+                    status => format!("HTTP {status}"),
+                };
+                fail(format!("{alias}: {reason}")).await;
+                return;
+            }
+            Err(err) => {
+                // The mismatch string sits somewhere in the source chain;
+                // reqwest_error_detail already walks it fully.
+                let detail = reqwest_error_detail(&err);
+                if detail.contains("fingerprint mismatch") {
+                    fail(format!("{alias}: {detail}")).await;
+                    return;
+                }
+                emit_log(
+                    &app,
+                    "send",
+                    format!(
+                        "{alias}: 地址 {}:{} 不可达,重试下一个 ({}/{})",
+                        channel.host,
+                        channel.port,
+                        idx + 1,
+                        total_channels
+                    ),
+                );
+                last_err = Some(err);
+            }
         }
-        Err(ClientError::StatusCode(err)) => {
-            let reason = match err.status {
-                401 => "需要 PIN 码".to_string(),
-                403 => "对方拒绝了".to_string(),
-                409 => "对方正忙(另一会话进行中)".to_string(),
-                429 => "请求太频繁".to_string(),
-                status => format!("HTTP {status}"),
-            };
-            fail(format!("{alias}: {reason}")).await;
-            return;
-        }
-        Err(err) => {
-            fail(format!("{alias}: {err}")).await;
-            return;
-        }
+    }
+
+    let (Some(client), Some(http), Some(prepared)) = (client, http, prepared) else {
+        let detail = last_err
+            .as_ref()
+            .map(reqwest_error_detail)
+            .unwrap_or_else(|| "没有可用地址".to_string());
+        fail(format!("{alias}: {detail}")).await;
+        return;
     };
 
     let Some(response) = prepared.response else {
@@ -1082,7 +1161,12 @@ async fn run_send(
                 let _ = client
                     .cancel(protocol.clone(), &http.host, http.port, &response.session_id)
                     .await;
-                fail(format!("{alias}: 上传 {} 失败: {err}", file.file_name)).await;
+                fail(format!(
+                    "{alias}: 上传 {} 失败: {}",
+                    file.file_name,
+                    reqwest_error_detail(&err)
+                ))
+                .await;
                 return;
             }
         }
