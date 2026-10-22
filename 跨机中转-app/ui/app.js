@@ -16,8 +16,7 @@ let islandText = "中转";
 // 消息历史: fingerprint -> [{dir,kind,text,files,sessionId,sendId,ts,state,ratio}]
 const history = new Map();
 let typeView = false; // 按类型分类显示模式
-let pendingPaths = null; // 拖拽进来但还没选设备时暂存的路径
-let dragDepth = 0;       // 拖拽悬停计数,避免在子元素间移动时闪烁
+let pendingPaths = null; // 拖拽/粘贴进来但还没选设备时暂存的路径
 
 function fmtBytes(n) {
   if (n < 1024) return `${n} B`;
@@ -478,8 +477,42 @@ function autosize() {
 }
 $("composer-input").addEventListener("input", autosize);
 
-// 粘贴:若内容是纯链接也直接可发(已是文本),无需特殊处理;这里做体验优化:含链接时提示 🔗
-$("composer-input").addEventListener("paste", () => setTimeout(autosize, 0));
+// 粘贴:若内容是纯链接也直接可发(已是文本);若剪贴板里是文件/文件夹
+// (Finder 里 ⌘C 复制的文件),WKWebView 不给 DataTransfer 绝对路径,
+// 走原生命令读 NSPasteboard 拿到真实路径后按拖拽同路径发送。
+$("composer-input").addEventListener("paste", (e) => {
+  const hasFiles = e.clipboardData &&
+    (e.clipboardData.files.length > 0 ||
+     Array.from(e.clipboardData.items || []).some((it) => it.kind === "file"));
+  // 没有文件迹象时也查一次原生剪贴板:Finder 复制的文件在 WKWebView 里
+  // items 里可能没有 kind === "file",只有文件名文本。先拦住默认插入文本,
+  // 若原生读不到路径再手动把文本塞回去,避免只显示文件名。
+  e.preventDefault();
+  (async () => {
+    let paths = [];
+    try {
+      paths = (await invoke("paste_file_paths")) || [];
+    } catch (err) {
+      // 命令不存在(非 macOS)或失败时退回纯文本粘贴
+    }
+    if (paths.length > 0) {
+      sendPaths(paths);
+    } else {
+      const ta = $("composer-input");
+      const text = (e.clipboardData && e.clipboardData.getData("text/plain")) || "";
+      if (text) {
+        const s = ta.selectionStart ?? ta.value.length;
+        const t = ta.selectionEnd ?? s;
+        ta.value = ta.value.slice(0, s) + text + ta.value.slice(t);
+        ta.selectionStart = ta.selectionEnd = s + text.length;
+      }
+      if (hasFiles) {
+        logLine("error", "剪贴板里有文件但拿不到路径,请改用拖拽或 📎 选择");
+      }
+      setTimeout(autosize, 0);
+    }
+  })();
+});
 
 // 统一发送入口:文件 / 照片 / 文件夹的路径数组 → 发给当前选中设备。
 // 未选设备时:只有一台在线设备则自动选中;否则暂存路径,等用户选定设备后自动发出。
@@ -522,23 +555,17 @@ $("btn-attach-dir").onclick = async () => {
 document.addEventListener("dragover", (e) => e.preventDefault());
 document.addEventListener("drop", (e) => e.preventDefault());
 
-// 悬停高亮(计数器避免在子元素间移动时闪烁)
-document.addEventListener("dragenter", (e) => {
-  e.preventDefault();
-  if (e.dataTransfer && Array.from(e.dataTransfer.types).includes("Files")) {
-    dragDepth++;
-    $("stage").classList.add("drag-over");
-  }
+// 悬停高亮:macOS 上 wry 用原生 NSDragging 接管拖拽,HTML5 的
+// dragenter/dragleave 不一定会触发,改用 Tauri 转发的事件。
+listen("tauri://drag-enter", () => {
+  $("stage").classList.add("drag-over");
 });
-document.addEventListener("dragleave", (e) => {
-  e.preventDefault();
-  if (dragDepth > 0) dragDepth--;
-  if (dragDepth === 0) $("stage").classList.remove("drag-over");
+listen("tauri://drag-leave", () => {
+  $("stage").classList.remove("drag-over");
 });
 
 // Tauri 原生拖放事件:拿到真实路径,文件和文件夹都支持
 listen("tauri://drag-drop", (e) => {
-  dragDepth = 0;
   $("stage").classList.remove("drag-over");
   const paths = (e.payload && e.payload.paths) || [];
   if (!paths.length) return;

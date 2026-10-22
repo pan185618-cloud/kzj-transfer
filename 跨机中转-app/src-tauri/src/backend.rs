@@ -1499,6 +1499,83 @@ pub async fn open_link(url: String) -> Result<(), String> {
     open::that_detached(u).map_err(|e| e.to_string())
 }
 
+/// Read absolute file paths off the general pasteboard so that pasting a
+/// copied file (Finder ⌘C → ⌘V in the composer) sends it like a drop.
+/// Returns an empty list when the pasteboard holds no file URLs.
+/// Same read path as the vendored wry drag-drop fix (wry#1844): the modern
+/// `readObjectsForClasses:options:` API, with NSFilenamesPboardType as
+/// fallback for apps that only publish the legacy type.
+#[tauri::command]
+pub async fn paste_file_paths() -> Result<Vec<String>, String> {
+    paste_file_paths_impl()
+}
+
+#[cfg(target_os = "macos")]
+fn paste_file_paths_impl() -> Result<Vec<String>, String> {
+    use objc2::ClassType;
+    use objc2_app_kit::NSPasteboard;
+    #[allow(deprecated)]
+    use objc2_app_kit::NSFilenamesPboardType;
+    use objc2_foundation::{NSArray, NSString, NSURL};
+    use std::ffi::CStr;
+
+    let mut out: Vec<String> = Vec::new();
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+
+        let url_classes = NSArray::from_slice(&[NSURL::class()]);
+        if let Some(items) = pb.readObjectsForClasses_options(&url_classes, None) {
+            for item in items.iter() {
+                if let Some(url) = item.downcast_ref::<NSURL>() {
+                    if !url.isFileURL() {
+                        continue;
+                    }
+                    // `filePathURL` resolves file reference URLs
+                    // (`file:///.file/id=...`) to real path URLs.
+                    if let Some(path) = url.filePathURL().and_then(|u| u.path()) {
+                        out.push(
+                            CStr::from_ptr(path.UTF8String())
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                }
+            }
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+
+        #[allow(deprecated)]
+        {
+            let types = NSArray::arrayWithObject(NSFilenamesPboardType);
+            if pb.availableTypeFromArray(&types).is_some() {
+                if let Some(pl) = pb.propertyListForType(NSFilenamesPboardType) {
+                    if let Ok(paths) = pl.downcast::<NSArray>() {
+                        for path in paths.iter() {
+                            if let Ok(path) = path.downcast::<NSString>() {
+                                out.push(
+                                    CStr::from_ptr(path.UTF8String())
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn paste_file_paths_impl() -> Result<Vec<String>, String> {
+    // Windows/Linux: WebView2/gtk paste doesn't expose absolute file paths
+    // through DataTransfer either; add a native reader per-platform if needed.
+    Ok(Vec::new())
+}
+
 #[tauri::command]
 pub async fn refresh_devices(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let interface_ips =

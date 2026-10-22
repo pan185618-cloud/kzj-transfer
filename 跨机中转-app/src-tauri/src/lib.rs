@@ -26,6 +26,7 @@ pub fn run() {
             backend::open_file,
             backend::read_image_preview,
             backend::open_link,
+            backend::paste_file_paths,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
