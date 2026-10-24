@@ -26,6 +26,40 @@ body {
   -webkit-app-region: drag;
 }
 
+/* Android: 状态栏 + 打孔摄像头会盖住顶栏。让系统把内容往安全区里推;
+   顶部两行布局,设备 chip 独占一行可横向滚动,不再和摄像头抢位置。 */
+@media (max-width: 560px) {
+  body { padding-top: env(safe-area-inset-top, 24px); }
+
+  .toolbar {
+    flex-wrap: wrap;
+    height: auto;
+    flex: 0 0 auto;
+    row-gap: 4px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+    position: relative;
+  }
+  /* 第一行:brand + spacer + 工具按钮 */
+  .toolbar > .spacer { order: 3; }
+  .toolbar > .tb-group { order: 4; }
+  /* 第二行:设备 chip 占满整行,可横滚 */
+  .toolbar > .device-bar {
+    order: 5;
+    flex-basis: 100%;
+    padding-bottom: 2px;
+  }
+  /* popover 改成底部抽屉样式,键盘弹起时不被设备栏挡住 */
+  .popover {
+    position: fixed;
+    top: auto; bottom: 72px;
+    left: 8px; right: 8px;
+    max-width: none;
+  }
+  /* 键盘弹出时把设备栏暂时收成一行,给输入框让位 */
+  body.kb-open .toolbar > .device-bar { display: none; }
+}
+
 .brand {
   font-weight: 700;
   font-size: 13px;
@@ -66,6 +100,19 @@ body {
 }
 .popover.hidden { display: none; }
 .pop-title { font-size: 12px; color: #86909c; margin-bottom: 6px; }
+
+/* 设备清单 */
+.dev-list { list-style: none; margin: 0; padding: 0; max-height: 280px; overflow-y: auto; }
+.dev-list li {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 6px; border-radius: 6px; cursor: pointer;
+  font-size: 13px; color: #1d2129;
+}
+.dev-list li:hover { background: #f2f3f5; }
+.dev-list li .dot { width: 7px; height: 7px; border-radius: 50%; background: #00b42a; flex-shrink: 0; }
+.dev-list li .meta { color: #86909c; font-size: 11.5px; margin-left: auto; }
+.dev-empty { font-size: 12.5px; color: #86909c; padding: 12px 4px; }
+.dev-empty.hidden { display: none; }
 
 #text-pop { display: flex; gap: 6px; }
 #text-pop.hidden { display: none; }
@@ -336,3 +383,14 @@ dialog button { border: 1px solid #e5e6eb; background: #fff; border-radius: 6px;
 
 /* 小窗模式隐藏输入区 */
 body.compact #composer { display: none !important; }
+
+/* ---------- 窄屏/手机适配 ---------- */
+
+@media (max-width: 560px) {
+  .toolbar { padding: 0 6px; gap: 4px; }
+  .tb-btn { padding: 5px 6px; }
+  .device-bar { gap: 4px; }
+  .chip { font-size: 11.5px; padding: 4px 8px; }
+  #composer { padding: 8px 8px; gap: 6px; }
+  .c-btn { width: 34px; height: 34px; }
+}

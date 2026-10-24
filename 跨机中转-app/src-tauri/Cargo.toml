@@ -3,11 +3,17 @@ name = "kuajizhongzhuan"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "kuajizhongzhuan"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-localsend = { path = "../../app/packages/core", features = ["full"] }
+# "full" without webrtc: the app never uses webrtc-signaling, and the webrtc
+# crate is a large dependency tree that does not build for Android.
+localsend = { path = "../../app/packages/core", features = ["crypto", "discovery", "http", "multicast"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +33,19 @@ pem = "4"
 reqwest = { version = "0.13.4", features = ["rustls-no-provider", "stream"], default-features = false }
 human-sort = "0.2"
 open = "5"
+
+# Android: reach ContentResolver for content:// URIs (file picks, SAF), and
+# build/model identity. Versions are pinned to what the lockfile already
+# resolved for tauri/wry so we link a single copy.
+[target.'cfg(target_os = "android")'.dependencies.jni]
+version = "0.21"
+[target.'cfg(target_os = "android")'.dependencies.ndk-context]
+version = "0.1"
+# Reach the wry runtime's `dispatch` for JNIEnv access on the Android main
+# thread. We already override crates.io wry via [patch.crates-io] to a vendored
+# copy, so depending on it here resolves to that same crate.
+[target.'cfg(target_os = "android")'.dependencies.wry]
+version = "0.57"
 
 # macOS: read file paths off the general pasteboard for paste-to-send.
 # Feature set mirrors vendored wry's (Cargo.lock already resolves these).

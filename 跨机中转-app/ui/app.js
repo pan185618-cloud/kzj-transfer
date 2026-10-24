@@ -4,6 +4,23 @@ const { listen } = window.__TAURI__.event;
 const { open, save } = window.__TAURI__.dialog;
 const { getCurrentWindow, LogicalSize, PhysicalPosition, currentMonitor } = window.__TAURI__.window;
 
+// Android WebView: no window management, no file-path drag/drop, no Finder-style
+// clipboard paths. Detect it once and hide the controls that cannot work there.
+const IS_ANDROID = /android/i.test(navigator.userAgent);
+
+// Android WebView 键盘弹出时视口高度会缩小,顶部设备栏容易被挤出去。
+// 监听 visualViewport 变化,键盘占屏超过 ~35% 时给 body 加 kb-open,
+// CSS 里把设备栏临时隐藏,给输入框+发送按钮腾位置。
+if (IS_ANDROID && window.visualViewport) {
+  const vv = window.visualViewport;
+  const check = () => {
+    const ratio = vv.height / window.screen.height;
+    document.body.classList.toggle("kb-open", ratio < 0.65);
+  };
+  vv.addEventListener("resize", check);
+  vv.addEventListener("scroll", check);
+}
+
 const $ = (id) => document.getElementById(id);
 
 const COMPACT_W = 320;
@@ -46,7 +63,7 @@ function logLine(category, text) {
 
 function renderDeviceBar() {
   const bar = $("device-bar");
-  // 保留 全部/按类型/+IP,重建设备 chip
+  // 保留 全部/按类型/手动连接/自动搜索/发现设备,重建设备 chip
   bar.querySelectorAll(".chip.dev").forEach((c) => c.remove());
   const addBtn = $("chip-add");
   for (const d of devices) {
@@ -62,6 +79,10 @@ function renderDeviceBar() {
   }
   $("chip-all").classList.toggle("active", selectedFingerprint === null && !typeView);
   $("chip-type").classList.toggle("active", typeView);
+  // 「发现设备」chip 上带个计数,一眼看到有没有设备
+  $("chip-list").textContent = devices.length > 0 ? `发现设备(${devices.length})` : "发现设备";
+  // 「发现设备」弹层打开时同步刷新
+  if (typeof renderDevPop === "function" && !$("dev-pop").classList.contains("hidden")) renderDevPop();
   // 无设备时给出明显提示
   $("device-hint").classList.toggle("hidden", devices.length > 0 || hasMessages());
 }
@@ -72,10 +93,10 @@ function selectDevice(fp) {
   renderDeviceBar();
   renderMessages();
   // 若拖拽进来的文件还在等选设备,选定后自动发出
-  if (pendingPaths && pendingPaths.length) {
-    const paths = pendingPaths;
+  if (pendingPaths) {
+    const { paths, picked } = pendingPaths;
     pendingPaths = null;
-    sendPaths(paths);
+    sendPaths(paths, picked);
   }
 }
 
@@ -463,7 +484,9 @@ async function doSendText() {
 
 $("composer-send").onclick = doSendText;
 $("composer-input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
+  // Android soft keyboards usually report Enter as "Unidentified"; also let the
+  // 发送 button carry the action, so only handle the desktop plain-Enter case.
+  if (!IS_ANDROID && e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     doSendText();
   }
@@ -516,38 +539,59 @@ $("composer-input").addEventListener("paste", (e) => {
 
 // 统一发送入口:文件 / 照片 / 文件夹的路径数组 → 发给当前选中设备。
 // 未选设备时:只有一台在线设备则自动选中;否则暂存路径,等用户选定设备后自动发出。
-async function sendPaths(paths) {
+// `picked` 是 Android SAF 选出来的对象数组(含 name/size/mimeType)。
+async function sendPaths(paths, picked = null) {
   if (!paths || paths.length === 0) return;
   if (!selectedFingerprint) {
     if (devices.length === 1) {
       selectDevice(devices[0].fingerprint);
     } else {
-      pendingPaths = paths;
+      pendingPaths = { paths, picked };
       logLine("send", "请先在顶部选择目标设备(已暂存待发送的文件)");
       $("device-hint").classList.remove("hidden");
       return;
     }
   }
   try {
-    await invoke("send_files", { fingerprint: selectedFingerprint, paths });
+    await invoke("send_files", { fingerprint: selectedFingerprint, paths, picked });
   } catch (err) {
     logLine("send", `发送失败: ${err}`);
   }
 }
 
 // 📎 发文件(不传 filters = 全部类型:图片/视频/文档/压缩包等)
+// Android: tauri-plugin-dialog 的 file picker 返回 content:// URI 而不是路径,
+// 我们把每一项的 uri/name/size/mimeType 一并给 Rust 侧,由它走 ContentResolver
+// 拿到 ParcelFileDescriptor 直接流式发送,不再落地复制。
 $("btn-attach").onclick = async () => {
   const sel = await open({ multiple: true, directory: false });
   if (!sel || sel.length === 0) return;
-  sendPaths(Array.isArray(sel) ? sel : [sel]);
+  const items = (Array.isArray(sel) ? sel : [sel]).map((s) => {
+    // 桌面端返回路径字符串;Android 返回 { uri, name, size, mimeType } 对象
+    if (typeof s === "string") return s;
+    return { uri: s.uri || s, name: s.name || null, size: s.size ?? null, mimeType: s.mimeType || s.mime_type || null };
+  });
+  // 桌面端路径还是字符串数组;Android 把 uri 数组塞到 paths,picked 塞对象数组
+  const paths = items.map((it) => (typeof it === "string" ? it : it.uri));
+  const picked = items.filter((it) => typeof it !== "string");
+  sendPaths(paths, picked);
 };
 
-// 📁 发整个文件夹(自动递归里面所有文件)
+// 📁 发整个文件夹(自动递归里面所有文件). Android 的 SAF 不提供目录路径,
+// tauri-plugin-dialog 的 directory picker 在手机上也拿不到可读的绝对路径,
+// 所以整个文件夹发送只在桌面端显示。
 $("btn-attach-dir").onclick = async () => {
   const sel = await open({ directory: true, multiple: true });
   if (!sel || sel.length === 0) return;
   sendPaths(Array.isArray(sel) ? sel : [sel]);
 };
+if (IS_ANDROID) {
+  $("btn-attach-dir").style.display = "none";
+  // 小窗(灵动岛)模式依赖窗口装饰/置顶 API,手机上没有意义。
+  $("btn-compact").style.display = "none";
+  // "打开接收目录"桌面端走 open(),Android 上没有等价文件管理器入口。
+  $("btn-open-dir").style.display = "none";
+}
 
 // ---------- 拖拽传输:文件 / 照片 / 文件夹 直接拖进窗口 ----------
 
@@ -596,8 +640,10 @@ $("composer-open-link").onclick = async () => {
 
 // ---------- 工具栏 ----------
 
+// 手动连接:弹出输 IP 的浮层
 $("chip-add").onclick = () => {
   $("ip-pop").classList.toggle("hidden");
+  $("dev-pop").classList.add("hidden");
   if (!$("ip-pop").classList.contains("hidden")) $("ip-input").focus();
 };
 $("btn-add-ip").onclick = async () => {
@@ -607,7 +653,7 @@ $("btn-add-ip").onclick = async () => {
     await invoke("add_device_ip", { ip, port: null });
     $("ip-input").value = "";
     $("ip-pop").classList.add("hidden");
-    logLine("discover", `已添加 ${ip}`);
+    logLine("discover", `已连接 ${ip}`);
   } catch (err) {
     logLine("error", `${err}`);
   }
@@ -615,13 +661,58 @@ $("btn-add-ip").onclick = async () => {
 $("ip-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") $("btn-add-ip").click();
 });
-$("btn-refresh").onclick = () => invoke("refresh_devices").catch(() => {});
+
+// 自动搜索:主动触发一次组播发现
+$("chip-scan").onclick = async () => {
+  logLine("discover", "正在搜索局域网设备…");
+  try {
+    await invoke("refresh_devices");
+  } catch (err) {
+    logLine("error", `${err}`);
+  }
+};
+// 顶部 ↻ 按钮等价于「自动搜索」
+$("btn-refresh").onclick = () => $("chip-scan").click();
+
+// 发现设备:弹出全部已发现设备的清单,点一个就选中它
+function renderDevPop() {
+  const list = $("dev-list");
+  list.innerHTML = "";
+  $("dev-empty").classList.toggle("hidden", devices.length > 0);
+  for (const d of devices) {
+    const li = document.createElement("li");
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    li.appendChild(dot);
+    const name = document.createElement("span");
+    name.textContent = d.alias;
+    li.appendChild(name);
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = `${d.host}:${d.port}`;
+    li.appendChild(meta);
+    li.onclick = () => {
+      selectDevice(d.fingerprint);
+      $("dev-pop").classList.add("hidden");
+    };
+    list.appendChild(li);
+  }
+}
+$("chip-list").onclick = () => {
+  renderDevPop();
+  $("dev-pop").classList.toggle("hidden");
+  $("ip-pop").classList.add("hidden");
+};
+
 $("btn-open-dir").onclick = () => invoke("open_received_dir").catch((e) => logLine("error", `${e}`));
 
 // 点击空白处关弹层
 document.addEventListener("click", (e) => {
   if (!e.target.closest("#ip-pop") && !e.target.closest("#chip-add")) {
     $("ip-pop").classList.add("hidden");
+  }
+  if (!e.target.closest("#dev-pop") && !e.target.closest("#chip-list")) {
+    $("dev-pop").classList.add("hidden");
   }
 });
 

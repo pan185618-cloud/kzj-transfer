@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>跨机中转</title>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -14,7 +14,9 @@
       <button id="chip-all" class="chip active">全部</button>
       <button id="chip-type" class="chip" title="按文件类型归类查看">按类型</button>
       <!-- 设备 chip 由 JS 插入 -->
-      <button id="chip-add" class="chip ghost-chip" title="手动添加设备 IP">+ IP</button>
+      <button id="chip-add" class="chip ghost-chip" title="手动连接设备 IP">手动连接</button>
+      <button id="chip-scan" class="chip ghost-chip" title="重新搜索局域网设备">自动搜索</button>
+      <button id="chip-list" class="chip ghost-chip" title="查看所有发现的设备">发现设备</button>
     </div>
     <span class="spacer"></span>
     <div class="tb-group">
@@ -27,11 +29,18 @@
 
   <!-- 手动添加 IP 弹层 -->
   <div id="ip-pop" class="popover hidden">
-    <div class="pop-title">手动添加设备</div>
+    <div class="pop-title">手动连接设备</div>
     <div class="add-ip">
       <input id="ip-input" type="text" placeholder="设备 IP,如 192.168.100.x">
-      <button id="btn-add-ip" class="ghost">添加</button>
+      <button id="btn-add-ip" class="ghost">连接</button>
     </div>
+  </div>
+
+  <!-- 发现的设备清单弹层 -->
+  <div id="dev-pop" class="popover hidden">
+    <div class="pop-title">发现的设备</div>
+    <ul id="dev-list" class="dev-list"></ul>
+    <div id="dev-empty" class="dev-empty hidden">还没发现设备,点「自动搜索」试试</div>
   </div>
 
   <!-- 中间:会话区 -->
@@ -54,7 +63,7 @@
   <footer id="composer">
     <button id="btn-attach" class="c-btn icon" title="发送文件(全部类型)">📎</button>
     <button id="btn-attach-dir" class="c-btn icon" title="发送整个文件夹">📁</button>
-    <textarea id="composer-input" rows="1" placeholder="输入文本/粘贴链接或文件,Enter 发送,Shift+Enter 换行"></textarea>
+    <textarea id="composer-input" rows="1" placeholder="输入文本或链接发送"></textarea>
     <button id="composer-open-link" class="c-btn icon" title="本机打开输入中的链接,不发送">🔗</button>
     <button id="composer-send" class="c-btn primary" title="发送">➤</button>
   </footer>

@@ -29,7 +29,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::sync::OnceLock;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// The app handle, stored at startup so helper functions (which run inside
+/// commands without a `State`) can reach Tauri's path resolver on Android.
+static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -108,12 +113,34 @@ impl Identity {
         }
     }
 
+    #[cfg(target_os = "android")]
+    fn device_model_string() -> String {
+        // 读 Android ro.product.model(厂商给的机型,如 "PKC110")。
+        std::process::Command::new("/system/bin/getprop")
+            .arg("ro.product.model")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Android".to_string())
+    }
+    #[cfg(not(target_os = "android"))]
+    fn device_model_string() -> String {
+        "跨机中转".to_string()
+    }
+
+    #[cfg(target_os = "android")]
+    const DEVICE_TYPE: DeviceType = DeviceType::Mobile;
+    #[cfg(not(target_os = "android"))]
+    const DEVICE_TYPE: DeviceType = DeviceType::Desktop;
+
     pub fn client_info(&self) -> ClientInfo {
         ClientInfo {
             alias: self.alias.clone(),
             version: PROTOCOL_VERSION_V2.to_string(),
-            device_model: Some("跨机中转".to_string()),
-            device_type: Some(DeviceType::Desktop),
+            device_model: Some(Self::device_model_string()),
+            device_type: Some(Self::DEVICE_TYPE),
             token: self.fingerprint.clone(),
         }
     }
@@ -122,8 +149,8 @@ impl Identity {
         RegisterDtoV2 {
             alias: self.alias.clone(),
             version: PROTOCOL_VERSION_V2.to_string(),
-            device_model: Some("跨机中转".to_string()),
-            device_type: Some(DeviceType::Desktop),
+            device_model: Some(Self::device_model_string()),
+            device_type: Some(Self::DEVICE_TYPE),
             fingerprint: self.fingerprint.clone(),
             port: self.port,
             protocol: ProtocolType::Https,
@@ -135,8 +162,8 @@ impl Identity {
         localsend::multicast::MulticastDevice {
             alias: self.alias.clone(),
             version: PROTOCOL_VERSION_V2.to_string(),
-            device_model: Some("跨机中转".to_string()),
-            device_type: Some(DeviceType::Desktop),
+            device_model: Some(Self::device_model_string()),
+            device_type: Some(Self::DEVICE_TYPE),
             fingerprint: self.fingerprint.clone(),
             port: self.port,
             protocol: ProtocolType::Https,
@@ -285,9 +312,31 @@ fn emit_devices(app: &AppHandle, discovery: &DiscoveryHandle, paired: &Mutex<Has
 }
 
 fn config_dir() -> PathBuf {
+    // Android: dirs::config_dir()/home_dir() come back empty (no $HOME), so
+    // fall back to the app-private data dir exposed by Tauri.
+    #[cfg(target_os = "android")]
+    {
+        if let Some(app) = APP_HANDLE.get() {
+            if let Ok(dir) = app.path().app_data_dir() {
+                return dir;
+            }
+        }
+    }
     dirs::config_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
         .join("跨机中转")
+}
+
+fn default_download_dir() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        if let Some(app) = APP_HANDLE.get() {
+            if let Ok(dir) = app.path().download_dir() {
+                return dir;
+            }
+        }
+    }
+    dirs::download_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
 }
 
 fn load_alias_config() -> (String, u16, PathBuf, HashSet<String>) {
@@ -297,7 +346,7 @@ fn load_alias_config() -> (String, u16, PathBuf, HashSet<String>) {
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "跨机中转".to_string());
     let mut port = 53317u16;
-    let mut dest = dirs::download_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
+    let mut dest = default_download_dir();
     let mut paired = HashSet::new();
     if let Ok(text) = std::fs::read_to_string(&path) {
         for line in text.lines() {
@@ -352,6 +401,7 @@ fn save_config(state: &AppState) {
 
 /// Spawned from `tauri::Builder::setup`.
 pub fn start(app: AppHandle) {
+    let _ = APP_HANDLE.set(app.clone());
     tauri::async_runtime::spawn(async move {
         if let Err(err) = start_inner(app.clone()).await {
             emit_log(&app, "error", format!("Backend failed to start: {err:#}"));
@@ -817,9 +867,138 @@ fn collect_files(paths: &[PathBuf]) -> (HashMap<String, FileDto>, HashMap<String
     (files, sources, total)
 }
 
+/// Android: SAF file pickers return `content://` URIs, not real paths. We can't
+/// turn those into a PathBuf — instead we record the URI + metadata and open the
+/// actual ParcelFileDescriptor at send time via ContentResolver.
+#[cfg(target_os = "android")]
+fn collect_files_android(items: Vec<AndroidPickItem>) -> (HashMap<String, FileDto>, HashMap<String, FileSource>, u64) {
+    let mut files = HashMap::new();
+    let mut sources = HashMap::new();
+    let mut total = 0u64;
+    for item in items {
+        let id = uuid::Uuid::new_v4().to_string();
+        let name = item.name.clone().unwrap_or_else(|| {
+            item.uri
+                .rsplit('/')
+                .next()
+                .unwrap_or("file")
+                .to_string()
+        });
+        let file_type = item
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let size = item.size.unwrap_or(0) as u64;
+        files.insert(
+            id.clone(),
+            FileDto {
+                id: id.clone(),
+                file_name: name,
+                size,
+                file_type,
+                sha256: None,
+                preview: None,
+                metadata: None,
+            },
+        );
+        sources.insert(id, FileSource::ContentUri(item.uri));
+        total += size;
+    }
+    (files, sources, total)
+}
+
+/// One row picked by Android's SAF dialog — URI plus whatever metadata the
+/// ContentResolver could tell us. Anything the provider won't say stays None.
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidPickItem {
+    pub uri: String,
+    pub name: Option<String>,
+    pub size: Option<i64>,
+    pub mime_type: Option<String>,
+}
+
 enum FileSource {
     Path(PathBuf),
     Bytes(Bytes),
+    /// Android: a `content://` URI resolved on demand via ContentResolver.
+    /// The raw fd is only opened at send time (in run_send), because that's
+    /// where `run_on_android_context` can hand us a live JNIEnv.
+    #[cfg(target_os = "android")]
+    ContentUri(String),
+}
+
+/// Android: open a `content://` URI as a raw read fd via ContentResolver.
+/// Ownership of the detached fd is handed to the caller (`FileContent::Fd`
+/// closes it when it finishes reading). JNIEnv lives on the main Android
+/// thread — wry's `dispatch` posts our closure there.
+#[cfg(target_os = "android")]
+fn open_content_uri_fd(_app: &AppHandle, uri: &str) -> Result<std::os::fd::RawFd, String> {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    let uri = uri.to_string();
+    wry::prelude::dispatch(move |env, activity, _webview| {
+        let result: Result<std::os::fd::RawFd, String> = (|| {
+            let uri_obj = env
+                .new_string(&uri)
+                .map_err(|e| format!("jni new_string: {e}"))?;
+            let uri_class = env
+                .find_class("android/net/Uri")
+                .map_err(|e| format!("find Uri class: {e}"))?;
+            let uri = env
+                .call_static_method(
+                    uri_class,
+                    "parse",
+                    "(Ljava/lang/String;)Landroid/net/Uri;",
+                    &[jni::objects::JValue::Object(&uri_obj.into())],
+                )
+                .map_err(|e| format!("Uri.parse: {e}"))?
+                .l()
+                .map_err(|e| format!("Uri.parse not object: {e}"))?;
+            let resolver = env
+                .call_method(
+                    activity,
+                    "getContentResolver",
+                    "()Landroid/content/ContentResolver;",
+                    &[],
+                )
+                .map_err(|e| format!("getContentResolver: {e}"))?
+                .l()
+                .map_err(|e| format!("resolver not object: {e}"))?;
+            let mode = env
+                .new_string("r")
+                .map_err(|e| format!("jni new_string: {e}"))?;
+            let pfd = env
+                .call_method(
+                    &resolver,
+                    "openFileDescriptor",
+                    "(Landroid/net/Uri;Ljava/lang/String;)Landroid/os/ParcelFileDescriptor;",
+                    &[
+                        jni::objects::JValue::Object(&uri),
+                        jni::objects::JValue::Object(&mode.into()),
+                    ],
+                )
+                .map_err(|e| format!("openFileDescriptor: {e}"))?
+                .l()
+                .map_err(|e| format!("pfd not object: {e}"))?;
+            if pfd.is_null() {
+                return Err("content provider returned null".to_string());
+            }
+            let fd = env
+                .call_method(&pfd, "detachFd", "()I", &[])
+                .map_err(|e| format!("detachFd: {e}"))?
+                .i()
+                .map_err(|e| format!("detachFd not int: {e}"))?;
+            if fd < 0 {
+                return Err(format!("detachFd returned {fd}"));
+            }
+            Ok(fd as std::os::fd::RawFd)
+        })();
+        let _ = tx.send(result);
+    });
+    rx.recv()
+        .map_err(|e| format!("android context channel closed: {e}"))?
 }
 
 fn collect_path(
@@ -1089,6 +1268,21 @@ async fn run_send(
                 let _ = tx.try_send(b);
                 FileContent::Stream(rx)
             }
+            #[cfg(target_os = "android")]
+            Some(FileSource::ContentUri(uri)) => {
+                match open_content_uri_fd(&app, &uri) {
+                    Ok(fd) => FileContent::Fd(fd),
+                    Err(e) => {
+                        fail(format!("{alias}: 无法读取文件 {uri}: {e}")).await;
+                        return;
+                    }
+                }
+            }
+            #[cfg(not(target_os = "android"))]
+            Some(other) => {
+                let _ = other;
+                continue;
+            }
             None => continue,
         };
         let base = sent_bytes;
@@ -1229,18 +1423,39 @@ pub async fn send_files(
     state: State<'_, Arc<AppState>>,
     fingerprint: String,
     paths: Vec<String>,
+    #[cfg(target_os = "android")] picked: Option<Vec<AndroidPickItem>>,
 ) -> Result<String, String> {
     let device = state
         .discovery
         .device_by_fingerprint(&fingerprint)
         .ok_or_else(|| "设备未被发现,请稍候或检查是否在同一局域网".to_string())?;
-    let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    for p in &paths {
-        if !p.exists() {
-            return Err(format!("文件不存在: {}", p.display()));
+
+    #[cfg(target_os = "android")]
+    let (files, sources, total_bytes) = {
+        let picked = picked.unwrap_or_default();
+        if !picked.is_empty() {
+            collect_files_android(picked)
+        } else {
+            let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+            for p in &paths {
+                if !p.exists() {
+                    return Err(format!("文件不存在: {}", p.display()));
+                }
+            }
+            collect_files(&paths)
         }
-    }
-    let (files, sources, total_bytes) = collect_files(&paths);
+    };
+    #[cfg(not(target_os = "android"))]
+    let (files, sources, total_bytes) = {
+        let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+        for p in &paths {
+            if !p.exists() {
+                return Err(format!("文件不存在: {}", p.display()));
+            }
+        }
+        collect_files(&paths)
+    };
+
     if files.is_empty() {
         return Err("没有可发送的文件".to_string());
     }
@@ -1257,6 +1472,8 @@ pub async fn send_files(
             saved_path: sources.get(&f.id).and_then(|s| match s {
                 FileSource::Path(p) => Some(p.display().to_string()),
                 FileSource::Bytes(_) => None,
+                #[cfg(target_os = "android")]
+                FileSource::ContentUri(_) => None,
             }),
         })
         .collect();
