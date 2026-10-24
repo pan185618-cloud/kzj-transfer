@@ -3,6 +3,9 @@ mod events;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Android: core 的 tracing 日志写到 stderr,Tauri 会转到 logcat(RustStdoutStderr)
+    #[cfg(target_os = "android")]
+    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).try_init();
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
     #[cfg(target_os = "android")]
     let builder = builder.plugin(backend::picker_plugin());

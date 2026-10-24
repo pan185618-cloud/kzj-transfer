@@ -39,6 +39,8 @@ open = "5"
 # resolved for tauri/wry so we link a single copy.
 [target.'cfg(target_os = "android")'.dependencies.jni]
 version = "0.21"
+[target.'cfg(target_os = "android")'.dependencies.tracing-subscriber]
+version = "0.3"
 [target.'cfg(target_os = "android")'.dependencies.ndk-context]
 version = "0.1"
 # Reach the wry runtime's `dispatch` for JNIEnv access on the Android main
