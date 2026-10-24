@@ -570,7 +570,9 @@ fn message_of(files: &HashMap<String, FileDto>) -> Option<String> {
 /// A device that reached us over HTTP (register or prepare-upload) is
 /// reachable — feed it into the discovery store so it shows up in the list.
 /// Mirrors cli/src/app/discovery.rs `device_confirmed`.
-fn device_confirmed(state: &Arc<AppState>, host: String, info: RegisterDtoV2) {
+/// Awaits the store update, so a following `emit_devices` already sees the device
+/// (it used to be spawned, and the list sent to the UI raced ahead of the add).
+async fn device_confirmed(state: &Arc<AppState>, host: String, info: RegisterDtoV2) {
     if info.fingerprint == state.identity.fingerprint {
         return;
     }
@@ -587,16 +589,13 @@ fn device_confirmed(state: &Arc<AppState>, host: String, info: RegisterDtoV2) {
         }),
         download: info.download,
     };
-    let discovery = state.discovery.clone();
-    tokio::spawn(async move {
-        discovery.add_device(device).await;
-    });
+    state.discovery.add_device(device).await;
 }
 
 async fn handle_server_event(app: &AppHandle, state: &Arc<AppState>, event: ServerEventV2) {
     match event {
         ServerEventV2::Register { ip, info } => {
-            device_confirmed(state, ip.to_string(), info);
+            device_confirmed(state, ip.to_string(), info).await;
             emit_devices(app, &state.discovery, &state.paired);
         }
         ServerEventV2::PrepareUpload {
@@ -608,7 +607,8 @@ async fn handle_server_event(app: &AppHandle, state: &Arc<AppState>, event: Serv
             decision_tx,
         } => {
             // The sender is clearly reachable; feed it into the store.
-            device_confirmed(state, ip.to_string(), info.clone());
+            device_confirmed(state, ip.to_string(), info.clone()).await;
+            emit_devices(app, &state.discovery, &state.paired);
             if let Some(message) = message_of(&files) {
                 let _ = decision_tx.send(PrepareUploadDecisionV2::Accept(HashSet::new()));
                 let fp = cert_fingerprint
