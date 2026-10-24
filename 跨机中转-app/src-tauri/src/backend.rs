@@ -2044,3 +2044,46 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     }
     out
 }
+
+// ---------- 聊天记录持久化 ----------
+// 前端把消息列表序列化成 JSON 交给后端,存成配置目录下的 history.json。
+// 写入先落临时文件再 rename,避免写到一半崩溃留下坏文件。
+
+fn history_path() -> PathBuf {
+    config_dir().join("history.json")
+}
+
+#[tauri::command]
+pub async fn load_history() -> Result<String, String> {
+    match std::fs::read_to_string(history_path()) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("[]".to_string()),
+        Err(e) => Err(format!("读取聊天记录失败: {e}")),
+    }
+}
+
+#[tauri::command]
+pub async fn save_history(json: String) -> Result<(), String> {
+    serde_json::from_str::<serde_json::Value>(&json).map_err(|e| format!("记录格式错误: {e}"))?;
+    let path = history_path();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("保存聊天记录失败: {e}"))
+}
+
+#[tauri::command]
+pub async fn clear_history() -> Result<(), String> {
+    match std::fs::remove_file(history_path()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}

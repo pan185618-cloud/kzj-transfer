@@ -632,6 +632,7 @@ function renderLinks(ul, msgs) {
 const TYPE_EMPTY = { image: "还没有收发过图片", file: "还没有收发过文件", link: "还没有收发过链接", date: "还没有内容" };
 
 function renderMessages() {
+  scheduleSave();
   const ul = $("msg-list");
   ul.innerHTML = "";
   let count = 0;
@@ -688,6 +689,53 @@ function hasMessages() {
 }
 
 // ---------- 历史记录 ----------
+
+// ---------- 持久化:重启后记录还在 ----------
+// 只存已结束的消息(传输中的有回调,重启后也无法继续);每台设备最多留 500 条。
+const KEEP_FIELDS = ["dir", "kind", "text", "files", "alias", "ts", "state", "statusText"];
+const MAX_PER_DEVICE = 500;
+let historyLoaded = false;
+let saveTimer = null;
+
+function serializeHistory() {
+  const out = [];
+  for (const [fp, msgs] of history) {
+    const done = msgs.filter((m) => m.state !== "sending").slice(-MAX_PER_DEVICE);
+    if (!done.length) continue;
+    out.push({
+      fp,
+      msgs: done.map((m) => {
+        const o = {};
+        for (const k of KEEP_FIELDS) if (m[k] !== undefined) o[k] = m[k];
+        return o;
+      }),
+    });
+  }
+  return JSON.stringify(out);
+}
+
+function scheduleSave() {
+  if (!historyLoaded) return; // 还没读完旧记录前不写,免得把旧记录覆盖成空
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    invoke("save_history", { json: serializeHistory() }).catch((e) => console.warn("save_history", e));
+  }, 600);
+}
+
+async function loadHistory() {
+  try {
+    const list = JSON.parse((await invoke("load_history")) || "[]");
+    for (const { fp, msgs } of list) {
+      if (!fp || !Array.isArray(msgs)) continue;
+      // 启动后才到的新消息(极少)排在旧记录之后
+      const old = msgs.map((m) => ({ ...m, _old: true }));
+      history.set(fp, [...old, ...(history.get(fp) || [])]);
+    }
+  } catch (e) {
+    console.warn("load_history", e);
+  }
+  historyLoaded = true;
+}
 
 function pushMsg(fp, msg) {
   if (!history.has(fp)) history.set(fp, []);
@@ -932,6 +980,17 @@ $("set-save").onclick = async () => {
   }
 };
 $("set-close").onclick = () => $("settings-dialog").close();
+$("set-clear").onclick = async () => {
+  if (!confirm("清空所有设备的聊天记录?已收到的文件不会删除。")) return;
+  history.clear();
+  try {
+    await invoke("clear_history");
+  } catch (e) {
+    logLine("error", `清空失败: ${e}`);
+  }
+  renderDevices();
+  toast("聊天记录已清空");
+};
 $("set-browse").onclick = async () => {
   try {
     const dir = await open({ directory: true, multiple: false, defaultPath: $("set-dest").value || undefined });
@@ -1050,7 +1109,7 @@ listen("send-progress", (e) => {
     renderMessages();
   } else if (p.kind === "text") {
     // message-received 已经建了气泡:按同文内容认领,避免重复气泡
-    const dup = msgs.find((x) => x.dir === "out" && x.kind === "text" && x.text === (p.textPreview || "") && !x._key);
+    const dup = msgs.find((x) => x.dir === "out" && x.kind === "text" && x.text === (p.textPreview || "") && !x._key && !x._old);
     if (dup) {
       dup._key = key;
       Object.assign(dup, patch);
@@ -1100,4 +1159,11 @@ invoke("list_devices")
   })
   .catch(() => {});
 
-setView("all");
+loadHistory().then(() => {
+  // 「按设备」默认选中最近有往来的设备
+  if (!selectedFingerprint) {
+    const k = knownDevices();
+    if (k.length === 1) selectedFingerprint = k[0].fp;
+  }
+  setView("all");
+});

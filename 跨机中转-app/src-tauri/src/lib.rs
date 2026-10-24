@@ -34,6 +34,9 @@ pub fn run() {
             backend::paste_file_paths,
             backend::pick_files,
             backend::pick_folder,
+            backend::load_history,
+            backend::save_history,
+            backend::clear_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
