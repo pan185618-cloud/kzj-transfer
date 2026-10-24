@@ -339,12 +339,47 @@ fn default_download_dir() -> PathBuf {
     dirs::download_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
 }
 
+/// Android 的 hostname 固定是 "localhost",对方看到的设备名就成了 localhost。
+/// 改用系统里的「设备名称」或市场名(如 "OPPO Find X8 Pro")。
+#[cfg(target_os = "android")]
+fn default_alias() -> String {
+    let getprop = |k: &str| {
+        std::process::Command::new("/system/bin/getprop")
+            .arg(k)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let settings = std::process::Command::new("/system/bin/settings")
+        .args(["get", "global", "device_name"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "null");
+    settings
+        .or_else(|| getprop("ro.vendor.oplus.market.name"))
+        .or_else(|| getprop("ro.product.marketname"))
+        .or_else(|| {
+            let brand = getprop("ro.product.brand").unwrap_or_default();
+            getprop("ro.product.model").map(|m| format!("{brand} {m}").trim().to_string())
+        })
+        .unwrap_or_else(|| "Android".to_string())
+}
+
+#[cfg(not(target_os = "android"))]
+fn default_alias() -> String {
+    hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "跨机中转".to_string())
+}
+
 fn load_alias_config() -> (String, u16, PathBuf, HashSet<String>) {
     let dir = config_dir();
     let path = dir.join("config.toml");
-    let mut alias = hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "跨机中转".to_string());
+    let mut alias = default_alias();
     let mut port = 53317u16;
     let mut dest = default_download_dir();
     let mut paired = HashSet::new();
@@ -353,7 +388,11 @@ fn load_alias_config() -> (String, u16, PathBuf, HashSet<String>) {
             let line = line.trim();
             if let Some(v) = line.strip_prefix("alias") {
                 if let Some(v) = v.trim_start().strip_prefix('=') {
-                    alias = v.trim().trim_matches('"').to_string();
+                    let v = v.trim().trim_matches('"').to_string();
+                    // 旧版在 Android 上把 hostname "localhost" 存成了设备名,忽略它
+                    if !v.is_empty() && v != "localhost" {
+                        alias = v;
+                    }
                 }
             } else if let Some(v) = line.strip_prefix("port") {
                 if let Some(v) = v.trim_start().strip_prefix('=') {
