@@ -22,7 +22,7 @@ app/.flutter-plugins*
 app/.metadata
 
 # 上游 LocalSend 源码(在远端仓库单独 clone,作为 git submodule 或独立仓库)
-app/
+/app/
 # 分发的二进制/zip
 分发包/
 跨机中转-cli

@@ -909,9 +909,9 @@ fn collect_files_android(items: Vec<AndroidPickItem>) -> (HashMap<String, FileDt
 
 /// One row picked by Android's SAF dialog — URI plus whatever metadata the
 /// ContentResolver could tell us. Anything the provider won't say stays None.
-#[cfg(target_os = "android")]
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub struct AndroidPickItem {
     pub uri: String,
     pub name: Option<String>,
@@ -1423,7 +1423,7 @@ pub async fn send_files(
     state: State<'_, Arc<AppState>>,
     fingerprint: String,
     paths: Vec<String>,
-    #[cfg(target_os = "android")] picked: Option<Vec<AndroidPickItem>>,
+    picked: Option<Vec<AndroidPickItem>>,
 ) -> Result<String, String> {
     let device = state
         .discovery
@@ -1447,6 +1447,7 @@ pub async fn send_files(
     };
     #[cfg(not(target_os = "android"))]
     let (files, sources, total_bytes) = {
+        let _ = picked;
         let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
         for p in &paths {
             if !p.exists() {
@@ -1911,7 +1912,7 @@ pub async fn add_device_ip(
         .discovery
         .discover(&ip, port, ProtocolType::Https)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| error_chain(&e))?;
     match found {
         Some(_) => {
             emit_devices(&app, &state.discovery, &state.paired);
@@ -1919,4 +1920,88 @@ pub async fn add_device_ip(
         }
         None => Err("对方是自己(指纹相同),无需添加".to_string()),
     }
+}
+
+// ---------- Android 系统文件选择器 ----------
+// tauri-plugin-dialog 在 Android 上只回裸 URI、不能选目录,这里走自带的
+// PickerPlugin.kt(ACTION_OPEN_DOCUMENT / ACTION_OPEN_DOCUMENT_TREE)。
+
+#[cfg(target_os = "android")]
+pub struct AndroidPicker<R: tauri::Runtime>(pub tauri::plugin::PluginHandle<R>);
+
+#[cfg(target_os = "android")]
+pub fn picker_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("picker")
+        .setup(|app, api| {
+            let handle =
+                api.register_android_plugin("com.kuajizhongzhuan.desktop", "PickerPlugin")?;
+            app.manage(AndroidPicker(handle));
+            Ok(())
+        })
+        .build()
+}
+
+#[cfg(target_os = "android")]
+#[derive(serde::Deserialize)]
+struct PickResult {
+    items: Vec<AndroidPickItem>,
+}
+
+#[cfg(target_os = "android")]
+async fn android_pick(app: &AppHandle, cmd: &str) -> Result<Vec<AndroidPickItem>, String> {
+    let picker = app.state::<AndroidPicker<tauri::Wry>>();
+    let r: PickResult = picker
+        .0
+        .run_mobile_plugin_async(cmd, serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(r.items)
+}
+
+/// Android: 选多个文件,返回 uri/name/size/mimeType。桌面端走 dialog 插件,不用这个。
+#[tauri::command]
+pub async fn pick_files(app: AppHandle) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        return android_pick(&app, "pickFiles")
+            .await
+            .map(|v| serde_json::to_value(v).unwrap_or_default());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Err("仅 Android 使用".to_string())
+    }
+}
+
+/// Android: 选一个文件夹,递归列出其中所有文件;name 为 "文件夹/相对路径"。
+#[tauri::command]
+pub async fn pick_folder(app: AppHandle) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        return android_pick(&app, "pickFolder")
+            .await
+            .map(|v| serde_json::to_value(v).unwrap_or_default());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Err("仅 Android 使用".to_string())
+    }
+}
+
+/// "a: b: c" — reqwest's top-level message ("error sending request") hides the
+/// actual cause (connection refused / TLS / timeout), so show the whole chain.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        let msg = s.to_string();
+        if !out.contains(&msg) {
+            out.push_str(": ");
+            out.push_str(&msg);
+        }
+        src = s.source();
+    }
+    out
 }

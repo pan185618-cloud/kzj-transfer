@@ -3,8 +3,10 @@ mod events;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(backend::picker_plugin());
+    builder
         .setup(|app| {
             backend::start(app.handle().clone());
             Ok(())
@@ -27,6 +29,8 @@ pub fn run() {
             backend::read_image_preview,
             backend::open_link,
             backend::paste_file_paths,
+            backend::pick_files,
+            backend::pick_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

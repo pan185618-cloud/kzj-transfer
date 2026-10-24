@@ -7,33 +7,53 @@ const { getCurrentWindow, LogicalSize, PhysicalPosition, currentMonitor } = wind
 // Android WebView: no window management, no file-path drag/drop, no Finder-style
 // clipboard paths. Detect it once and hide the controls that cannot work there.
 const IS_ANDROID = /android/i.test(navigator.userAgent);
+if (IS_ANDROID) document.body.classList.add("android");
 
-// Android WebView 键盘弹出时视口高度会缩小,顶部设备栏容易被挤出去。
-// 监听 visualViewport 变化,键盘占屏超过 ~35% 时给 body 加 kb-open,
-// CSS 里把设备栏临时隐藏,给输入框+发送按钮腾位置。
+// Android WebView 键盘弹出时视口高度会缩小:给 body 加 kb-open,
+// CSS 里把分类栏临时收起,给输入框腾位置。
 if (IS_ANDROID && window.visualViewport) {
   const vv = window.visualViewport;
   const check = () => {
     const ratio = vv.height / window.screen.height;
     document.body.classList.toggle("kb-open", ratio < 0.65);
+    // 键盘盖住的高度:底部抽屉/菜单要整体抬高,否则输入框被挡住
+    const covered = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    document.documentElement.style.setProperty("--kb", `${covered}px`);
   };
   vv.addEventListener("resize", check);
   vv.addEventListener("scroll", check);
 }
 
+// 发现设备面板里的输入框获得焦点时,面板顶到屏幕上方,避免被软键盘挡住
+// (edge-to-edge 下 WebView 不随键盘缩小,visualViewport 也不一定变化)
+document.addEventListener("focusin", (e) => {
+  if (IS_ANDROID && e.target.closest && e.target.closest(".sheet")) document.body.classList.add("sheet-typing");
+});
+document.addEventListener("focusout", () => document.body.classList.remove("sheet-typing"));
+
 const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
 
 const COMPACT_W = 320;
 const COMPACT_H = 36;
 
 let devices = [];
+// 发送目标设备(和「按设备」的查看筛选同步,但「全部/按类型」视图下也保留)
 let selectedFingerprint = null;
 let pendingRequest = null;
 let islandText = "中转";
-// 消息历史: fingerprint -> [{dir,kind,text,files,sessionId,sendId,ts,state,ratio}]
+// 消息历史: fingerprint -> [{dir,kind,text,files,alias,ts,state,ratio,statusText}]
 const history = new Map();
-let typeView = false; // 按类型分类显示模式
-let pendingPaths = null; // 拖拽/粘贴进来但还没选设备时暂存的路径
+// 视图: all 全部 / device 按设备 / type 按类型
+let view = "all";
+let typeFilter = "image"; // image / file / link / date
+let pendingPaths = null; // 选好文件但还没选设备时暂存
+let scanning = false;
 
 function fmtBytes(n) {
   if (n < 1024) return `${n} B`;
@@ -42,97 +62,257 @@ function fmtBytes(n) {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 const fmtSpeed = (bps) => (bps > 0 ? `${fmtBytes(Math.round(bps))}/s` : "");
+const pad2 = (n) => String(n).padStart(2, "0");
 const fmtTime = (ts) => {
   const d = new Date(ts);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 };
-
-function logLine(category, text) {
-  const el = $("log");
-  const line = document.createElement("div");
-  const cat = document.createElement("span");
-  cat.className = "cat";
-  cat.textContent = `[${category}] `;
-  line.appendChild(cat);
-  line.appendChild(document.createTextNode(text));
-  el.appendChild(line);
-  el.scrollTop = el.scrollHeight;
+function dayKey(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+function dayLabel(ts) {
+  const today = new Date();
+  const k = dayKey(ts);
+  if (k === dayKey(today)) return "今天";
+  const y = new Date(today);
+  y.setDate(today.getDate() - 1);
+  if (k === dayKey(y)) return "昨天";
+  const d = new Date(ts);
+  const wk = "日一二三四五六"[d.getDay()];
+  return d.getFullYear() === today.getFullYear()
+    ? `${d.getMonth() + 1}月${d.getDate()}日 周${wk}`
+    : `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`;
 }
 
-// ---------- 设备 chip 栏 ----------
+// ---------- 提示条(替代原来堆在底部的日志) ----------
 
-function renderDeviceBar() {
-  const bar = $("device-bar");
-  // 保留 全部/按类型/手动连接/自动搜索/发现设备,重建设备 chip
-  bar.querySelectorAll(".chip.dev").forEach((c) => c.remove());
-  const addBtn = $("chip-add");
-  for (const d of devices) {
-    const chip = document.createElement("button");
-    chip.className = "chip dev" + (d.fingerprint === selectedFingerprint ? " active" : "");
-    chip.title = `${d.alias} · ${d.host}:${d.port}`;
-    const dot = document.createElement("span");
-    dot.className = "dot";
-    chip.appendChild(dot);
-    chip.appendChild(document.createTextNode(d.alias));
-    chip.onclick = () => selectDevice(d.fingerprint);
-    bar.insertBefore(chip, addBtn);
+// 后端的启动/发现类日志对用户没有意义,只在控制台留底
+const QUIET = new Set(["system"]);
+
+function logLine(category, text) {
+  console.log(`[${category}] ${text}`);
+  if (QUIET.has(category)) return;
+  const kind = category === "error" || /失败|错误|无法|不可用/.test(text) ? "err" : "info";
+  toast(text, kind);
+}
+
+function toast(text, kind = "info") {
+  const box = $("toasts");
+  const t = el("div", `toast ${kind}`, text);
+  box.appendChild(t);
+  while (box.children.length > 3) box.firstChild.remove();
+  setTimeout(() => {
+    t.classList.add("out");
+    setTimeout(() => t.remove(), 300);
+  }, kind === "err" ? 5000 : 2600);
+}
+
+// ---------- 设备 ----------
+
+function deviceIcon(d) {
+  const t = (d && d.deviceType || "").toLowerCase();
+  if (t.includes("mobile")) {
+    return '<svg viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M11 18h2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
   }
-  $("chip-all").classList.toggle("active", selectedFingerprint === null && !typeView);
-  $("chip-type").classList.toggle("active", typeView);
-  // 「发现设备」chip 上带个计数,一眼看到有没有设备
-  $("chip-list").textContent = devices.length > 0 ? `发现设备(${devices.length})` : "发现设备";
-  // 「发现设备」弹层打开时同步刷新
-  if (typeof renderDevPop === "function" && !$("dev-pop").classList.contains("hidden")) renderDevPop();
-  // 无设备时给出明显提示
-  $("device-hint").classList.toggle("hidden", devices.length > 0 || hasMessages());
+  return '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="11" rx="1.8" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M2 19h20" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+}
+
+function deviceByFp(fp) {
+  return devices.find((d) => d.fingerprint === fp);
+}
+
+// 历史里出现过的设备(可能已离线)也要能在「按设备」里看到
+function knownDevices() {
+  const list = devices.map((d) => ({ fp: d.fingerprint, alias: d.alias, online: true, d }));
+  for (const [fp, msgs] of history) {
+    if (!msgs.length || list.some((x) => x.fp === fp)) continue;
+    list.push({ fp, alias: msgs[msgs.length - 1].alias || "未知设备", online: false, d: null });
+  }
+  return list;
+}
+
+function renderDevices() {
+  const n = devices.length;
+  $("discover-count").textContent = String(n);
+  $("discover-count").classList.toggle("hidden", n === 0);
+  $("brand-sub").textContent = n ? `${n} 台设备在线` : scanning ? "正在搜索设备…" : "未发现设备";
+  $("brand-sub").classList.toggle("on", n > 0);
+
+  // 发送目标
+  const target = deviceByFp(selectedFingerprint);
+  $("target").classList.toggle("hidden", !target);
+  if (target) $("target-name").textContent = target.alias;
+
+  renderDevList();
+  renderSubDevice();
+  renderMessages();
 }
 
 function selectDevice(fp) {
   selectedFingerprint = fp;
-  typeView = false;
-  renderDeviceBar();
-  renderMessages();
-  // 若拖拽进来的文件还在等选设备,选定后自动发出
-  if (pendingPaths) {
+  renderDevices();
+  // 文件已选好、在等设备:选定后自动发出
+  if (pendingPaths && fp) {
     const { paths, picked } = pendingPaths;
     pendingPaths = null;
     sendPaths(paths, picked);
   }
 }
 
-function hasMessages() {
-  for (const msgs of history.values()) if (msgs.length) return true;
+// 当前发送目标;未选时若只有一台在线设备就默认它,否则打开「发现设备」
+function ensureTarget() {
+  if (selectedFingerprint && deviceByFp(selectedFingerprint)) return true;
+  if (devices.length === 1) {
+    selectDevice(devices[0].fingerprint);
+    return true;
+  }
+  openSheet();
+  toast(devices.length ? "先选一台要发送的设备" : "还没有发现设备");
   return false;
 }
 
-$("chip-all").onclick = () => {
-  selectedFingerprint = null;
-  typeView = false;
-  renderDeviceBar();
-  renderMessages();
+// ---------- 发现设备面板(自动搜索 + 手动连接) ----------
+
+function renderDevList() {
+  const list = $("dev-list");
+  list.innerHTML = "";
+  $("dev-empty").classList.toggle("hidden", devices.length > 0);
+  for (const d of devices) {
+    const li = el("li", "dev-item" + (d.fingerprint === selectedFingerprint ? " selected" : ""));
+    const icon = el("span", "dev-icon");
+    icon.innerHTML = deviceIcon(d);
+    const info = el("span", "dev-info");
+    info.append(el("b", null, d.alias), el("small", null, `${d.host}${d.paired ? " · 已信任" : ""}`));
+    const check = el("span", "dev-check");
+    check.innerHTML = '<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    li.append(icon, info, check);
+    li.onclick = () => {
+      selectDevice(d.fingerprint);
+      closeSheet();
+    };
+    list.appendChild(li);
+  }
+}
+
+function openSheet() {
+  $("discover-sheet").classList.remove("hidden");
+  renderDevList();
+  scan(true);
+}
+function closeSheet() {
+  $("discover-sheet").classList.add("hidden");
+}
+
+async function scan(quiet = false) {
+  if (scanning) return;
+  scanning = true;
+  $("discover-sheet").classList.add("scanning");
+  renderDevices();
+  try {
+    await invoke("refresh_devices");
+  } catch (err) {
+    if (!quiet) logLine("error", `搜索失败: ${err}`);
+  } finally {
+    // 发现是异步回报的,留一点时间给回包
+    setTimeout(() => {
+      scanning = false;
+      $("discover-sheet").classList.remove("scanning");
+      renderDevices();
+    }, 1500);
+  }
+}
+
+$("btn-discover").onclick = openSheet;
+$("hint-discover").onclick = openSheet;
+$("target-change").onclick = openSheet;
+$("sheet-close").onclick = closeSheet;
+document.querySelector(".sheet-backdrop").onclick = closeSheet;
+$("btn-scan").onclick = () => scan(false);
+
+$("btn-add-ip").onclick = async () => {
+  const ip = $("ip-input").value.trim();
+  if (!ip) return;
+  const btn = $("btn-add-ip");
+  btn.disabled = true;
+  btn.textContent = "连接中…";
+  try {
+    await invoke("add_device_ip", { ip, port: null });
+    $("ip-input").value = "";
+    toast(`已连接 ${ip}`);
+  } catch (err) {
+    logLine("error", `连接 ${ip} 失败: ${err}`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "连接";
+  }
 };
-$("chip-type").onclick = () => {
-  typeView = !typeView;
-  selectedFingerprint = null;
-  renderDeviceBar();
-  renderMessages();
-};
+$("ip-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("btn-add-ip").click();
+});
+
+// ---------- 分类:全部 / 按设备 / 按类型 ----------
+
+function setView(v) {
+  view = v;
+  document.querySelectorAll(".seg").forEach((b) => b.classList.toggle("active", b.dataset.view === v));
+  const idx = ["all", "device", "type"].indexOf(v);
+  document.querySelector(".segmented").style.setProperty("--i", idx);
+  $("sub-device").classList.toggle("hidden", v !== "device");
+  $("sub-type").classList.toggle("hidden", v !== "type");
+  if (v === "device" && !selectedFingerprint) {
+    const k = knownDevices();
+    if (k.length) selectedFingerprint = k[0].fp;
+  }
+  renderDevices();
+}
+document.querySelectorAll(".seg").forEach((b) => (b.onclick = () => setView(b.dataset.view)));
+document.querySelectorAll("#sub-type .pill").forEach((b) => {
+  b.onclick = () => {
+    typeFilter = b.dataset.type;
+    document.querySelectorAll("#sub-type .pill").forEach((x) => x.classList.toggle("active", x === b));
+    renderMessages();
+  };
+});
+
+function renderSubDevice() {
+  const bar = $("sub-device");
+  bar.innerHTML = "";
+  const list = knownDevices();
+  if (!list.length) {
+    bar.appendChild(el("span", "sub-empty", "还没有设备,点右上角「发现设备」"));
+    return;
+  }
+  for (const k of list) {
+    const b = el("button", "pill dev-pill" + (k.fp === selectedFingerprint ? " active" : "") + (k.online ? "" : " offline"));
+    const icon = el("span", "pill-icon");
+    icon.innerHTML = deviceIcon(k.d);
+    b.append(icon, document.createTextNode(k.alias));
+    const n = (history.get(k.fp) || []).length;
+    if (n) b.appendChild(el("span", "pill-count", String(n)));
+    b.onclick = () => selectDevice(k.fp);
+    bar.appendChild(b);
+  }
+}
 
 // ---------- 消息区渲染 ----------
 
 const URL_RE = /https?:\/\/[^\s"'<>]+/g;
+
+function openLink(url) {
+  invoke("open_link", { url }).catch((err) => logLine("error", `${err}`));
+}
 
 function linkify(text) {
   const frag = document.createDocumentFragment();
   let last = 0;
   for (const m of text.matchAll(URL_RE)) {
     if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
-    const a = document.createElement("a");
+    const a = el("a", null, m[0]);
     a.href = "#";
-    a.textContent = m[0];
     a.onclick = (e) => {
       e.preventDefault();
-      invoke("open_link", { url: m[0] }).catch((err) => logLine("error", `${err}`));
+      openLink(m[0]);
     };
     frag.appendChild(a);
     last = m.index + m[0].length;
@@ -141,45 +321,39 @@ function linkify(text) {
   return frag;
 }
 
-function typeTag(f) {
-  const t = (f.fileType || f.file_type || "").toLowerCase();
-  if (t.startsWith("image/")) return "[图片]";
-  if (t.startsWith("video/")) return "[视频]";
-  if (t.startsWith("audio/")) return "[音频]";
-  if (t.includes("pdf")) return "[PDF]";
-  if (t.startsWith("text/")) return "[文本]";
-  if (t.includes("zip") || t.includes("compressed") || t.includes("tar")) return "[压缩]";
-  if (t.includes("word") || t.includes("officedocument")) return "[文档]";
-  const ext = (f.name || "").split(".").pop();
-  return ext && ext !== f.name ? `[${ext.toUpperCase()}]` : "[文件]";
+const mimeOf = (f) => (f.fileType || f.file_type || "").toLowerCase();
+const isImage = (f) => mimeOf(f).startsWith("image/");
+
+// 文件类型 → [标签, 颜色]
+function fileKind(f) {
+  const t = mimeOf(f);
+  const ext = ((f.name || "").split(".").pop() || "").toLowerCase();
+  if (t.startsWith("image/")) return ["IMG", "c-green"];
+  if (t.startsWith("video/")) return ["VID", "c-purple"];
+  if (t.startsWith("audio/")) return ["AUD", "c-pink"];
+  if (t.includes("pdf")) return ["PDF", "c-red"];
+  if (t.includes("zip") || t.includes("compressed") || t.includes("tar") || ["rar", "7z", "gz"].includes(ext)) return ["ZIP", "c-amber"];
+  if (t.includes("word") || ["doc", "docx"].includes(ext)) return ["DOC", "c-blue"];
+  if (t.includes("sheet") || t.includes("excel") || ["xls", "xlsx", "csv"].includes(ext)) return ["XLS", "c-green"];
+  if (t.includes("presentation") || ["ppt", "pptx"].includes(ext)) return ["PPT", "c-orange"];
+  if (t.startsWith("text/")) return ["TXT", "c-slate"];
+  if (ext && ext !== (f.name || "").toLowerCase() && ext.length <= 4) return [ext.toUpperCase(), "c-slate"];
+  return ["FILE", "c-slate"];
 }
 
-function typeIcon(f) {
-  const t = (f.fileType || f.file_type || "").toLowerCase();
-  if (t.startsWith("image/")) return "🖼";
-  if (t.startsWith("video/")) return "🎬";
-  if (t.startsWith("audio/")) return "🎵";
-  if (t.includes("pdf")) return "📕";
-  if (t.startsWith("text/")) return "📄";
-  if (t.includes("zip") || t.includes("compressed") || t.includes("tar")) return "🗜";
-  return "📦";
-}
-
-// 文件分类(按 typeTag 大类)
-function typeGroup(f) {
-  const tag = typeTag(f);
-  return tag;
+function kindBadge(f) {
+  const [label, color] = fileKind(f);
+  return el("span", `f-badge ${color}`, label);
 }
 
 // ---------- 文件夹分组显示 ----------
-// name 形如 "目录名/子路径/文件"(来自 collect_path 的 strip_prefix):
+// name 形如 "目录名/子路径/文件"(桌面 collect_path 与 Android 选文件夹都这样命名):
 // 第一段是顶层目录名 → 该文件归入这个文件夹组;不带 "/" 的是顶层散文件。
 
 function isFolderMsg(m) {
   return m.kind === "files" && (m.files || []).some((f) => (f.name || "").includes("/"));
 }
 
-// 按第一段路径分组,保持文件原有顺序
 function groupByFolder(files) {
   const groups = [];
   const byName = new Map();
@@ -206,26 +380,15 @@ function groupByFolder(files) {
   return groups;
 }
 
-// 文件夹卡片:📁 文件夹名 + N 个文件/总大小,点击打开文件夹;
-// 下方缩进列出组内文件(相对路径),单击仍可打开单个文件。
-function bubbleForFolder(g, dir) {
-  const wrap = document.createElement("div");
-  wrap.className = "f-folder";
+const FOLDER_SVG = '<svg viewBox="0 0 24 24"><path d="M3.5 7.5A2.5 2.5 0 0 1 6 5h3.6l2 2.2H18a2.5 2.5 0 0 1 2.5 2.5V17a2.5 2.5 0 0 1-2.5 2.5H6A2.5 2.5 0 0 1 3.5 17V7.5Z" fill="currentColor" opacity=".9"/></svg>';
 
-  const head = document.createElement("div");
-  head.className = "f-card f-folder-head";
-  const icon = document.createElement("span");
-  icon.className = "f-icon";
-  icon.textContent = "📁";
-  const info = document.createElement("div");
-  info.className = "f-info";
-  const name = document.createElement("div");
-  name.className = "f-name";
-  name.textContent = `[文件夹] ${g.name}`;
-  const sub = document.createElement("div");
-  sub.className = "f-sub";
-  sub.textContent = `${g.files.length} 个文件 · ${fmtBytes(g.size)}`;
-  info.append(name, sub);
+function bubbleForFolder(g, dir) {
+  const wrap = el("div", "f-folder");
+  const head = el("div", "f-card f-folder-head");
+  const icon = el("span", "f-badge c-amber folder");
+  icon.innerHTML = FOLDER_SVG;
+  const info = el("div", "f-info");
+  info.append(el("div", "f-name", g.name), el("div", "f-sub", `文件夹 · ${g.files.length} 个文件 · ${fmtBytes(g.size)}`));
   head.append(icon, info);
   if (g.dirPath) {
     head.classList.add("openable");
@@ -235,104 +398,102 @@ function bubbleForFolder(g, dir) {
   }
   wrap.appendChild(head);
 
-  const list = document.createElement("div");
-  list.className = "f-folder-items";
-  for (const f of g.files) {
-    const rel = { ...f, name: f.name.slice(g.name.length + 1) };
-    const item = bubbleForFile(rel, dir);
-    item.classList.add("f-subitem");
-    list.appendChild(item);
+  const list = el("div", "f-folder-items");
+  const MAX = 6;
+  const render = (files) => {
+    list.innerHTML = "";
+    for (const f of files) {
+      const item = bubbleForFile({ ...f, name: f.name.slice(g.name.length + 1) }, dir, true);
+      item.classList.add("f-subitem");
+      list.appendChild(item);
+    }
+  };
+  render(g.files.slice(0, MAX));
+  if (g.files.length > MAX) {
+    const more = el("button", "f-more", `展开其余 ${g.files.length - MAX} 个文件`);
+    more.onclick = (e) => {
+      e.stopPropagation();
+      render(g.files);
+      more.remove();
+    };
+    wrap.append(list, more);
+  } else {
+    wrap.appendChild(list);
   }
-  wrap.appendChild(list);
   return wrap;
 }
 
-function bubbleForFile(f, dir) {
-  const card = document.createElement("div");
-  card.className = "f-card";
-  const icon = document.createElement("span");
-  icon.className = "f-icon";
-  icon.textContent = typeIcon(f);
-  const info = document.createElement("div");
-  info.className = "f-info";
-  const name = document.createElement("div");
-  name.className = "f-name";
-  name.textContent = `${typeTag(f)} ${f.name}`;
-  const sub = document.createElement("div");
-  sub.className = "f-sub";
-  sub.textContent = fmtBytes(f.size || 0);
-  info.append(name, sub);
+function loadThumb(img, path, onFail) {
+  invoke("read_image_preview", { path })
+    .then((url) => (img.src = url))
+    .catch(onFail);
+}
+
+function saveAs(f, path) {
+  return async (e) => {
+    e.stopPropagation();
+    try {
+      const dot = (f.name || "").lastIndexOf(".");
+      const ext = dot > 0 ? f.name.slice(dot + 1) : null;
+      // 扩展名合法才加过滤器,避免对话框报错
+      const filters = /^[a-zA-Z0-9]{1,10}$/.test(ext || "")
+        ? [{ name: `${ext.toUpperCase()} 文件`, extensions: [ext] }, { name: "所有文件", extensions: ["*"] }]
+        : undefined;
+      const dst = await save({ defaultPath: (f.name || "").split("/").pop(), filters });
+      if (!dst) return;
+      await invoke("copy_file_to", { src: path, dst });
+      toast(`已另存为 ${dst}`);
+    } catch (err) {
+      logLine("error", `另存为失败: ${err}`);
+    }
+  };
+}
+
+function bubbleForFile(f, dir, compact = false) {
+  const card = el("div", "f-card");
+  const info = el("div", "f-info");
+  info.append(el("div", "f-name", f.name), el("div", "f-sub", fmtBytes(f.size || 0)));
   const path = f.savedPath || f.saved_path;
-  const isImage = (f.fileType || f.file_type || "").toLowerCase().startsWith("image/");
-  // 图片:在气泡里直接显示缩略图(懒加载,失败回落到图标)
-  if (isImage && path) {
+  const badge = kindBadge(f);
+
+  // 图片:在气泡里直接显示缩略图,失败回落到类型图标
+  if (isImage(f) && path && !compact) {
     card.classList.add("has-thumb");
-    const thumb = document.createElement("img");
-    thumb.className = "f-thumb";
+    const thumb = el("img", "f-thumb");
     thumb.alt = f.name || "";
-    thumb.loading = "lazy";
-    thumb.onerror = () => {
+    loadThumb(thumb, path, () => {
       thumb.remove();
       card.classList.remove("has-thumb");
-      card.prepend(icon);
-    };
-    invoke("read_image_preview", { path })
-      .then((url) => {
-        thumb.src = url;
-        card.prepend(thumb);
-      })
-      .catch(() => {
-        thumb.remove();
-        card.classList.remove("has-thumb");
-        card.prepend(icon);
-      });
-    card.append(info);
+      card.prepend(badge);
+    });
+    card.append(thumb, info);
   } else {
-    card.append(icon, info);
+    card.append(badge, info);
   }
   if (path) {
     card.classList.add("openable");
     card.title = path;
     card.onclick = () =>
       invoke("open_file", { path }).catch((e) => logLine("error", `打开失败: ${e}`));
-    // 另存为:弹出系统保存对话框,把文件复制到用户选的位置
-    const saveBtn = document.createElement("button");
-    saveBtn.className = "f-save-as";
-    saveBtn.textContent = "另存为";
-    saveBtn.title = "保存到其他位置";
-    saveBtn.onclick = async (e) => {
-      e.stopPropagation();
-      try {
-        const dot = (f.name || "").lastIndexOf(".");
-        const ext = dot > 0 ? f.name.slice(dot + 1) : null;
-        // 扩展名合法才加过滤器,避免对话框报错
-        const filters = /^[a-zA-Z0-9]{1,10}$/.test(ext || "")
-          ? [{ name: `${ext.toUpperCase()} 文件`, extensions: [ext] }, { name: "所有文件", extensions: ["*"] }]
-          : undefined;
-        const dst = await save({ defaultPath: f.name, filters });
-        if (!dst) return;
-        await invoke("copy_file_to", { src: path, dst });
-        logLine("save", `已另存为: ${dst}`);
-      } catch (err) {
-        logLine("error", `另存为失败: ${err}`);
-      }
-    };
-    card.appendChild(saveBtn);
+    if (!IS_ANDROID && !compact) {
+      const saveBtn = el("button", "f-save-as", "另存为");
+      saveBtn.title = "保存到其他位置";
+      saveBtn.onclick = saveAs(f, path);
+      card.appendChild(saveBtn);
+    }
   }
   return card;
 }
 
+function metaText(m) {
+  const who = m.dir === "in" ? m.alias : `发给 ${m.alias}`;
+  return view === "device" ? fmtTime(m.ts) : `${who} · ${fmtTime(m.ts)}`;
+}
+
 function msgNode(m) {
-  const li = document.createElement("li");
-  li.className = `msg ${m.dir}`;
-
-  const meta = document.createElement("div");
-  meta.className = "m-meta";
-  meta.textContent = `${m.dir === "in" ? m.alias + " · " : ""}${fmtTime(m.ts)}${m.dir === "out" ? " · 发给 " + m.alias : ""}`;
-  li.appendChild(meta);
-
-  const bubble = document.createElement("div");
-  bubble.className = "bubble";
+  const li = el("li", `msg ${m.dir}`);
+  li.appendChild(el("div", "m-meta", metaText(m)));
+  const bubble = el("div", "bubble" + (m.kind === "text" ? " text" : " files"));
 
   if (m.kind === "text") {
     bubble.appendChild(linkify(m.text));
@@ -340,106 +501,190 @@ function msgNode(m) {
     for (const g of groupByFolder(m.files)) {
       bubble.appendChild(g.name === null ? bubbleForFile(g.files[0], m.dir) : bubbleForFolder(g, m.dir));
     }
+  } else if ((m.files || []).length === 0) {
+    bubble.appendChild(el("div", "f-pending", m.dir === "in" ? "正在接收…" : "正在准备…"));
   } else {
-    for (const f of m.files || []) bubble.appendChild(bubbleForFile(f, m.dir));
+    for (const f of m.files) bubble.appendChild(bubbleForFile(f, m.dir));
   }
 
-  // 进度条与状态(传输中)
   if (m.state && m.state !== "done") {
-    const bar = document.createElement("div");
-    bar.className = "bar";
-    bar.innerHTML = "<div></div>";
-    bar.firstChild.style.width = `${Math.min(100, Math.round((m.ratio || 0) * 100))}%`;
+    const bar = el("div", "bar");
+    const fill = el("div");
+    fill.style.width = `${Math.min(100, Math.round((m.ratio || 0) * 100))}%`;
+    bar.appendChild(fill);
     bubble.appendChild(bar);
-    const status = document.createElement("div");
-    status.className = "t-status";
-    status.textContent = m.statusText || "";
-    bubble.appendChild(status);
+    const row = el("div", "t-row");
+    row.appendChild(el("span", "t-status" + (m.state === "failed" || m.state === "cancelled" ? " bad" : ""), m.statusText || ""));
     if (m.cancellable) {
-      const btn = document.createElement("button");
-      btn.className = "t-cancel";
-      btn.textContent = "取消";
+      const btn = el("button", "t-cancel", "取消");
       btn.onclick = m.onCancel || (() => {});
-      bubble.appendChild(btn);
+      row.appendChild(btn);
     }
-  } else if (m.statusText) {
-    const status = document.createElement("div");
-    status.className = "t-status";
-    status.textContent = m.statusText;
-    bubble.appendChild(status);
+    bubble.appendChild(row);
+  } else if (m.statusText && m.kind !== "text") {
+    bubble.appendChild(el("div", "t-row", "")).appendChild(el("span", "t-status", m.statusText));
   }
 
   li.appendChild(bubble);
   return li;
 }
 
+function allMsgs(filterFp = null) {
+  const out = [];
+  for (const [fp, msgs] of history) {
+    if (filterFp && fp !== filterFp) continue;
+    for (const m of msgs) out.push(m);
+  }
+  return out.sort((a, b) => a.ts - b.ts);
+}
+
+function dayDivider(ts) {
+  const li = el("li", "day-divider");
+  li.appendChild(el("span", null, dayLabel(ts)));
+  return li;
+}
+
+// 带日期分隔的聊天流
+function renderChat(ul, msgs) {
+  let last = null;
+  for (const m of msgs) {
+    const k = dayKey(m.ts);
+    if (k !== last) {
+      ul.appendChild(dayDivider(m.ts));
+      last = k;
+    }
+    ul.appendChild(msgNode(m));
+  }
+}
+
+function renderImages(ul, msgs) {
+  const items = [];
+  for (const m of msgs) {
+    if (m.kind !== "files") continue;
+    for (const f of m.files || []) if (isImage(f) && (f.savedPath || f.saved_path)) items.push({ m, f });
+  }
+  if (!items.length) return 0;
+  const li = el("li", "gallery");
+  for (const { m, f } of items.reverse()) {
+    const path = f.savedPath || f.saved_path;
+    const cell = el("button", "g-cell");
+    cell.title = `${f.name} · ${m.alias} · ${fmtTime(m.ts)}`;
+    const img = el("img");
+    img.alt = f.name;
+    loadThumb(img, path, () => {
+      img.remove();
+      cell.appendChild(kindBadge(f));
+    });
+    cell.appendChild(img);
+    cell.appendChild(el("span", `g-dir ${m.dir}`, m.dir === "in" ? "收" : "发"));
+    cell.onclick = () => invoke("open_file", { path }).catch((e) => logLine("error", `打开失败: ${e}`));
+    li.appendChild(cell);
+  }
+  ul.appendChild(li);
+  return items.length;
+}
+
+function renderFiles(ul, msgs) {
+  const rows = [];
+  for (const m of msgs) {
+    if (m.kind !== "files") continue;
+    for (const f of m.files || []) if (!isImage(f)) rows.push({ m, f });
+  }
+  if (!rows.length) return 0;
+  const li = el("li", "list-card");
+  for (const { m, f } of rows.reverse()) {
+    const row = bubbleForFile(f, m.dir, true);
+    row.classList.add("list-row");
+    row.querySelector(".f-sub").textContent =
+      `${fmtBytes(f.size || 0)} · ${m.dir === "in" ? "来自 " : "发给 "}${m.alias} · ${dayLabel(m.ts)} ${fmtTime(m.ts)}`;
+    li.appendChild(row);
+  }
+  ul.appendChild(li);
+  return rows.length;
+}
+
+function renderLinks(ul, msgs) {
+  const rows = [];
+  for (const m of msgs) {
+    if (m.kind !== "text") continue;
+    for (const u of m.text.match(URL_RE) || []) rows.push({ m, u });
+  }
+  if (!rows.length) return 0;
+  const li = el("li", "list-card");
+  for (const { m, u } of rows.reverse()) {
+    const row = el("div", "f-card list-row openable");
+    const badge = el("span", "f-badge c-blue link");
+    badge.innerHTML = '<svg viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+    const info = el("div", "f-info");
+    let host = u;
+    try {
+      host = new URL(u).host;
+    } catch (_) {}
+    info.append(el("div", "f-name", host), el("div", "f-sub", u));
+    row.append(badge, info);
+    row.onclick = () => openLink(u);
+    li.appendChild(row);
+  }
+  ul.appendChild(li);
+  return rows.length;
+}
+
+const TYPE_EMPTY = { image: "还没有收发过图片", file: "还没有收发过文件", link: "还没有收发过链接", date: "还没有内容" };
+
 function renderMessages() {
   const ul = $("msg-list");
   ul.innerHTML = "";
-  const has = renderInto(ul);
-  $("empty-hint").classList.toggle("hidden", has || devices.length === 0);
-  $("device-hint").classList.toggle("hidden", devices.length > 0 || has);
-  // 滚到底部
-  $("stage").scrollTop = $("stage").scrollHeight;
+  let count = 0;
+  if (view === "all") {
+    const msgs = allMsgs();
+    renderChat(ul, msgs);
+    count = msgs.length;
+  } else if (view === "device") {
+    const msgs = selectedFingerprint ? allMsgs(selectedFingerprint) : [];
+    renderChat(ul, msgs);
+    count = msgs.length;
+  } else {
+    const msgs = allMsgs();
+    if (typeFilter === "image") count = renderImages(ul, msgs);
+    else if (typeFilter === "file") count = renderFiles(ul, msgs);
+    else if (typeFilter === "link") count = renderLinks(ul, msgs);
+    else {
+      // 日期:按天倒序分组的时间线
+      const byDay = new Map();
+      for (const m of msgs) {
+        const k = dayKey(m.ts);
+        if (!byDay.has(k)) byDay.set(k, []);
+        byDay.get(k).push(m);
+      }
+      for (const k of [...byDay.keys()].sort().reverse()) {
+        const ms = byDay.get(k);
+        const head = dayDivider(ms[0].ts);
+        head.firstChild.textContent += ` · ${ms.length} 条`;
+        ul.appendChild(head);
+        for (const m of ms) ul.appendChild(msgNode(m));
+      }
+      count = msgs.length;
+    }
+  }
+
+  const noDevices = devices.length === 0 && !hasMessages();
+  $("device-hint").classList.toggle("hidden", !noDevices);
+  $("empty-hint").classList.toggle("hidden", noDevices || count > 0);
+  if (!noDevices && count === 0) {
+    $("empty-sub").textContent =
+      view === "type" ? TYPE_EMPTY[typeFilter]
+      : view === "device" && selectedFingerprint ? `和 ${(deviceByFp(selectedFingerprint) || {}).alias || "这台设备"} 之间还没有内容`
+      : IS_ANDROID ? "输入文字或链接点「发送」,点左下角文件夹图标发送文件或整个文件夹"
+      : "输入文字或链接按 Enter 发送;点左下角文件夹图标发文件/文件夹,也可以直接把文件拖进窗口或 ⌘V 粘贴";
+  }
+  // 时间线类视图滚到底部,列表类视图停在顶部(最新在上)
+  const stage = $("stage");
+  stage.scrollTop = view === "type" && typeFilter !== "date" ? 0 : stage.scrollHeight;
 }
 
-// 返回是否渲染了至少一条
-function renderInto(ul) {
-  let count = 0;
-  if (typeView) {
-    // 按类型分组:收集所有文件消息
-    const groups = new Map();
-    for (const [fp, msgs] of history) {
-      if (selectedFingerprint && fp !== selectedFingerprint) continue;
-      for (const m of msgs) {
-        if (m.kind !== "files" || !m.files) continue;
-        for (const f of m.files) {
-          const g = typeGroup(f);
-          if (!groups.has(g)) groups.set(g, []);
-          groups.get(g).push({ m, f });
-        }
-      }
-    }
-    const keys = [...groups.keys()].sort();
-    for (const k of keys) {
-      const head = document.createElement("li");
-      head.className = "type-head";
-      head.textContent = `${k} (${groups.get(k).length})`;
-      ul.appendChild(head);
-      for (const { m, f } of groups.get(k)) {
-        const node = msgNode({ ...m, files: [f] });
-        ul.appendChild(node);
-        count++;
-      }
-    }
-    // 文本消息不分组,追加在最后? 或也显示?按需求"按文件类型分类"主要针对文件;文本归入[文本]已由 typeTag 处理,但 text 消息没有 files — 单独一组
-    const texts = [];
-    for (const [fp, msgs] of history) {
-      if (selectedFingerprint && fp !== selectedFingerprint) continue;
-      for (const m of msgs) if (m.kind === "text") texts.push(m);
-    }
-    if (texts.length) {
-      const head = document.createElement("li");
-      head.className = "type-head";
-      head.textContent = `[文本/链接] (${texts.length})`;
-      ul.appendChild(head);
-      for (const m of texts) {
-        ul.appendChild(msgNode(m));
-        count++;
-      }
-    }
-    return count > 0;
-  }
-
-  // 设备视图
-  for (const [fp, msgs] of history) {
-    if (selectedFingerprint && fp !== selectedFingerprint) continue;
-    for (const m of msgs) {
-      ul.appendChild(msgNode(m));
-      count++;
-    }
-  }
-  return count > 0;
+function hasMessages() {
+  for (const msgs of history.values()) if (msgs.length) return true;
+  return false;
 }
 
 // ---------- 历史记录 ----------
@@ -447,14 +692,7 @@ function renderInto(ul) {
 function pushMsg(fp, msg) {
   if (!history.has(fp)) history.set(fp, []);
   history.get(fp).push(msg);
-  renderMessages();
-}
-
-function updateTransfer(key, fp, patch) {
-  const msgs = history.get(fp);
-  if (!msgs) return;
-  const m = msgs.find((x) => x._key === key);
-  if (m) Object.assign(m, patch);
+  renderSubDevice();
   renderMessages();
 }
 
@@ -463,60 +701,47 @@ function updateTransfer(key, fp, patch) {
 async function doSendText() {
   const text = $("composer-input").value.trim();
   if (!text) return;
-  if (!selectedFingerprint) {
-    // 未选设备:若只有一台在线设备则默认选它
-    if (devices.length === 1) {
-      selectDevice(devices[0].fingerprint);
-    } else {
-      logLine("send", "请先在顶部选择目标设备");
-      $("device-hint").classList.remove("hidden");
-      return;
-    }
-  }
+  if (!ensureTarget()) return;
   try {
     await invoke("send_text", { fingerprint: selectedFingerprint, text });
     $("composer-input").value = "";
     autosize();
   } catch (err) {
-    logLine("send", `发送失败: ${err}`);
+    logLine("error", `发送失败: ${err}`);
   }
 }
 
 $("composer-send").onclick = doSendText;
 $("composer-input").addEventListener("keydown", (e) => {
-  // Android soft keyboards usually report Enter as "Unidentified"; also let the
-  // 发送 button carry the action, so only handle the desktop plain-Enter case.
-  if (!IS_ANDROID && e.key === "Enter" && !e.shiftKey) {
+  // Android 软键盘的回车是换行,发送交给「发送」按钮
+  if (!IS_ANDROID && e.key === "Enter" && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
     doSendText();
   }
 });
 
-// 输入框自动增高
 function autosize() {
   const ta = $("composer-input");
   ta.style.height = "auto";
   ta.style.height = Math.min(ta.scrollHeight, 120) + "px";
+  $("composer").classList.toggle("has-text", ta.value.trim().length > 0);
 }
 $("composer-input").addEventListener("input", autosize);
 
-// 粘贴:若内容是纯链接也直接可发(已是文本);若剪贴板里是文件/文件夹
-// (Finder 里 ⌘C 复制的文件),WKWebView 不给 DataTransfer 绝对路径,
+// 粘贴(桌面):剪贴板里若是 Finder ⌘C 复制的文件,WKWebView 不给绝对路径,
 // 走原生命令读 NSPasteboard 拿到真实路径后按拖拽同路径发送。
 $("composer-input").addEventListener("paste", (e) => {
+  if (IS_ANDROID) return; // 手机上按系统默认粘贴文本
   const hasFiles = e.clipboardData &&
     (e.clipboardData.files.length > 0 ||
      Array.from(e.clipboardData.items || []).some((it) => it.kind === "file"));
-  // 没有文件迹象时也查一次原生剪贴板:Finder 复制的文件在 WKWebView 里
-  // items 里可能没有 kind === "file",只有文件名文本。先拦住默认插入文本,
-  // 若原生读不到路径再手动把文本塞回去,避免只显示文件名。
   e.preventDefault();
   (async () => {
     let paths = [];
     try {
       paths = (await invoke("paste_file_paths")) || [];
-    } catch (err) {
-      // 命令不存在(非 macOS)或失败时退回纯文本粘贴
+    } catch (_) {
+      // 非 macOS 或失败时退回纯文本粘贴
     }
     if (paths.length > 0) {
       sendPaths(paths);
@@ -529,192 +754,106 @@ $("composer-input").addEventListener("paste", (e) => {
         ta.value = ta.value.slice(0, s) + text + ta.value.slice(t);
         ta.selectionStart = ta.selectionEnd = s + text.length;
       }
-      if (hasFiles) {
-        logLine("error", "剪贴板里有文件但拿不到路径,请改用拖拽或 📎 选择");
-      }
+      if (hasFiles) logLine("error", "剪贴板里有文件但拿不到路径,请改用拖拽或文件夹按钮选择");
       setTimeout(autosize, 0);
     }
   })();
 });
 
-// 统一发送入口:文件 / 照片 / 文件夹的路径数组 → 发给当前选中设备。
-// 未选设备时:只有一台在线设备则自动选中;否则暂存路径,等用户选定设备后自动发出。
-// `picked` 是 Android SAF 选出来的对象数组(含 name/size/mimeType)。
+// 统一发送入口:路径数组(桌面)或 Android 选择器给的 picked 对象数组。
 async function sendPaths(paths, picked = null) {
-  if (!paths || paths.length === 0) return;
-  if (!selectedFingerprint) {
-    if (devices.length === 1) {
-      selectDevice(devices[0].fingerprint);
-    } else {
-      pendingPaths = { paths, picked };
-      logLine("send", "请先在顶部选择目标设备(已暂存待发送的文件)");
-      $("device-hint").classList.remove("hidden");
-      return;
-    }
+  if ((!paths || !paths.length) && (!picked || !picked.length)) return;
+  if (!ensureTarget()) {
+    pendingPaths = { paths, picked };
+    const n = (picked && picked.length) || (paths || []).length;
+    toast(`已选 ${n} 项,选好设备后自动发送`);
+    return;
   }
   try {
-    await invoke("send_files", { fingerprint: selectedFingerprint, paths, picked });
+    await invoke("send_files", { fingerprint: selectedFingerprint, paths: paths || [], picked });
   } catch (err) {
-    logLine("send", `发送失败: ${err}`);
+    logLine("error", `发送失败: ${err}`);
   }
 }
 
-// 📎 发文件(不传 filters = 全部类型:图片/视频/文档/压缩包等)
-// Android: tauri-plugin-dialog 的 file picker 返回 content:// URI 而不是路径,
-// 我们把每一项的 uri/name/size/mimeType 一并给 Rust 侧,由它走 ContentResolver
-// 拿到 ParcelFileDescriptor 直接流式发送,不再落地复制。
-$("btn-attach").onclick = async () => {
-  const sel = await open({ multiple: true, directory: false });
-  if (!sel || sel.length === 0) return;
-  const items = (Array.isArray(sel) ? sel : [sel]).map((s) => {
-    // 桌面端返回路径字符串;Android 返回 { uri, name, size, mimeType } 对象
-    if (typeof s === "string") return s;
-    return { uri: s.uri || s, name: s.name || null, size: s.size ?? null, mimeType: s.mimeType || s.mime_type || null };
-  });
-  // 桌面端路径还是字符串数组;Android 把 uri 数组塞到 paths,picked 塞对象数组
-  const paths = items.map((it) => (typeof it === "string" ? it : it.uri));
-  const picked = items.filter((it) => typeof it !== "string");
-  sendPaths(paths, picked);
+// 文件夹按钮 → 菜单:选择文件 / 选择文件夹
+function toggleMenu(show) {
+  const menu = $("attach-menu");
+  const on = show ?? menu.classList.contains("hidden");
+  menu.classList.toggle("hidden", !on);
+  $("btn-attach").classList.toggle("active", on);
+}
+$("btn-attach").onclick = (e) => {
+  e.stopPropagation();
+  toggleMenu();
 };
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#attach-menu")) toggleMenu(false);
+});
 
-// 📁 发整个文件夹(自动递归里面所有文件). Android 的 SAF 不提供目录路径,
-// tauri-plugin-dialog 的 directory picker 在手机上也拿不到可读的绝对路径,
-// 所以整个文件夹发送只在桌面端显示。
-$("btn-attach-dir").onclick = async () => {
-  const sel = await open({ directory: true, multiple: true });
-  if (!sel || sel.length === 0) return;
-  sendPaths(Array.isArray(sel) ? sel : [sel]);
-};
-if (IS_ANDROID) {
-  $("btn-attach-dir").style.display = "none";
-  // 小窗(灵动岛)模式依赖窗口装饰/置顶 API,手机上没有意义。
-  $("btn-compact").style.display = "none";
-  // "打开接收目录"桌面端走 open(),Android 上没有等价文件管理器入口。
-  $("btn-open-dir").style.display = "none";
+// Android:自带的 PickerPlugin(SAF),返回 {uri,name,size,mimeType};
+// 选文件夹时 name 带「文件夹/相对路径」前缀,接收端按文件夹分组。
+async function androidPick(cmd) {
+  const items = await invoke(cmd);
+  return (items || []).filter((it) => it && it.uri);
 }
 
-// ---------- 拖拽传输:文件 / 照片 / 文件夹 直接拖进窗口 ----------
+$("pick-files").onclick = async () => {
+  toggleMenu(false);
+  try {
+    if (IS_ANDROID) {
+      const items = await androidPick("pick_files");
+      if (items.length) sendPaths([], items);
+    } else {
+      const sel = await open({ multiple: true, directory: false });
+      if (sel && sel.length) sendPaths(Array.isArray(sel) ? sel : [sel]);
+    }
+  } catch (err) {
+    logLine("error", `选择文件失败: ${err}`);
+  }
+};
 
-// 阻止浏览器默认行为(否则拖进来会在窗口里直接打开文件)
+$("pick-folder").onclick = async () => {
+  toggleMenu(false);
+  try {
+    if (IS_ANDROID) {
+      const items = await androidPick("pick_folder");
+      if (items.length) {
+        sendPaths([], items);
+      } else {
+        toast("这个文件夹里没有文件");
+      }
+    } else {
+      const sel = await open({ directory: true, multiple: true });
+      if (sel && sel.length) sendPaths(Array.isArray(sel) ? sel : [sel]);
+    }
+  } catch (err) {
+    logLine("error", `选择文件夹失败: ${err}`);
+  }
+};
+
+// ---------- 拖拽传输(桌面):文件 / 照片 / 文件夹 直接拖进窗口 ----------
+
 document.addEventListener("dragover", (e) => e.preventDefault());
 document.addEventListener("drop", (e) => e.preventDefault());
 
-// 悬停高亮:macOS 上 wry 用原生 NSDragging 接管拖拽,HTML5 的
-// dragenter/dragleave 不一定会触发,改用 Tauri 转发的事件。
-listen("tauri://drag-enter", () => {
-  $("stage").classList.add("drag-over");
-});
-listen("tauri://drag-leave", () => {
-  $("stage").classList.remove("drag-over");
-});
-
-// Tauri 原生拖放事件:拿到真实路径,文件和文件夹都支持
+// macOS 上 wry 用原生 NSDragging 接管拖拽,改用 Tauri 转发的事件做悬停高亮
+listen("tauri://drag-enter", () => $("stage").classList.add("drag-over"));
+listen("tauri://drag-leave", () => $("stage").classList.remove("drag-over"));
 listen("tauri://drag-drop", (e) => {
   $("stage").classList.remove("drag-over");
   const paths = (e.payload && e.payload.paths) || [];
   if (!paths.length) {
-    // macOS 某些拖拽源(如从 Finder 的「快速查看」、归档工具的预览窗格、
-    // 网页图片)只给出非文件 URL,wry 解不出路径——不静默吞掉,提示用户。
-    logLine("error", "拖拽的内容未识别到文件路径,请改用 📎 选择文件,或从 Finder 中拖动");
+    // 某些拖拽源(快速查看、网页图片)只给非文件 URL,wry 解不出路径
+    logLine("error", "拖拽的内容未识别到文件路径,请改用文件夹按钮选择,或从 Finder 中拖动");
     return;
   }
   sendPaths(paths);
 });
 
-// 🔗 本机打开输入中的链接(不发送)
-$("composer-open-link").onclick = async () => {
-  const text = $("composer-input").value;
-  const urls = text.match(URL_RE) || [];
-  if (!urls.length) {
-    logLine("error", "输入中没有识别到 http/https 链接");
-    return;
-  }
-  for (const u of urls.slice(0, 10)) {
-    try {
-      await invoke("open_link", { url: u });
-    } catch (err) {
-      logLine("error", `打开失败: ${err}`);
-    }
-  }
-};
-
 // ---------- 工具栏 ----------
 
-// 手动连接:弹出输 IP 的浮层
-$("chip-add").onclick = () => {
-  $("ip-pop").classList.toggle("hidden");
-  $("dev-pop").classList.add("hidden");
-  if (!$("ip-pop").classList.contains("hidden")) $("ip-input").focus();
-};
-$("btn-add-ip").onclick = async () => {
-  const ip = $("ip-input").value.trim();
-  if (!ip) return;
-  try {
-    await invoke("add_device_ip", { ip, port: null });
-    $("ip-input").value = "";
-    $("ip-pop").classList.add("hidden");
-    logLine("discover", `已连接 ${ip}`);
-  } catch (err) {
-    logLine("error", `${err}`);
-  }
-};
-$("ip-input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") $("btn-add-ip").click();
-});
-
-// 自动搜索:主动触发一次组播发现
-$("chip-scan").onclick = async () => {
-  logLine("discover", "正在搜索局域网设备…");
-  try {
-    await invoke("refresh_devices");
-  } catch (err) {
-    logLine("error", `${err}`);
-  }
-};
-// 顶部 ↻ 按钮等价于「自动搜索」
-$("btn-refresh").onclick = () => $("chip-scan").click();
-
-// 发现设备:弹出全部已发现设备的清单,点一个就选中它
-function renderDevPop() {
-  const list = $("dev-list");
-  list.innerHTML = "";
-  $("dev-empty").classList.toggle("hidden", devices.length > 0);
-  for (const d of devices) {
-    const li = document.createElement("li");
-    const dot = document.createElement("span");
-    dot.className = "dot";
-    li.appendChild(dot);
-    const name = document.createElement("span");
-    name.textContent = d.alias;
-    li.appendChild(name);
-    const meta = document.createElement("span");
-    meta.className = "meta";
-    meta.textContent = `${d.host}:${d.port}`;
-    li.appendChild(meta);
-    li.onclick = () => {
-      selectDevice(d.fingerprint);
-      $("dev-pop").classList.add("hidden");
-    };
-    list.appendChild(li);
-  }
-}
-$("chip-list").onclick = () => {
-  renderDevPop();
-  $("dev-pop").classList.toggle("hidden");
-  $("ip-pop").classList.add("hidden");
-};
-
 $("btn-open-dir").onclick = () => invoke("open_received_dir").catch((e) => logLine("error", `${e}`));
-
-// 点击空白处关弹层
-document.addEventListener("click", (e) => {
-  if (!e.target.closest("#ip-pop") && !e.target.closest("#chip-add")) {
-    $("ip-pop").classList.add("hidden");
-  }
-  if (!e.target.closest("#dev-pop") && !e.target.closest("#chip-list")) {
-    $("dev-pop").classList.add("hidden");
-  }
-});
 
 // ---------- 灵动岛 ----------
 
@@ -806,22 +945,24 @@ $("set-browse").onclick = async () => {
 
 listen("devices-changed", (e) => {
   devices = e.payload;
-  if (selectedFingerprint && !devices.some((d) => d.fingerprint === selectedFingerprint)) {
+  // 离线设备在「按设备」里仍可查看历史;只有发送目标在「全部/按类型」下失效时才清掉
+  if (selectedFingerprint && !deviceByFp(selectedFingerprint) && !history.has(selectedFingerprint)) {
     selectedFingerprint = null;
   }
-  renderDeviceBar();
+  if (!selectedFingerprint && devices.length === 1) selectedFingerprint = devices[0].fingerprint;
+  renderDevices();
 });
 
 listen("log", (e) => logLine(e.payload.category, e.payload.text));
 
 listen("receive-request", (e) => {
   pendingRequest = e.payload;
-  $("req-title").textContent = `${e.payload.alias} 想发送 ${e.payload.files.length} 个文件 (${fmtBytes(e.payload.totalBytes)})`;
+  $("req-title").textContent = `${e.payload.alias} 想发给你 ${e.payload.files.length} 个文件 · ${fmtBytes(e.payload.totalBytes)}`;
   const ul = $("req-files");
   ul.innerHTML = "";
   for (const f of e.payload.files) {
-    const li = document.createElement("li");
-    li.textContent = `${typeTag(f)} ${f.name} — ${fmtBytes(f.size)}`;
+    const li = el("li");
+    li.append(kindBadge(f), el("span", "rf-name", f.name), el("span", "rf-size", fmtBytes(f.size)));
     ul.appendChild(li);
   }
   $("receive-dialog").showModal();
@@ -836,19 +977,19 @@ listen("receive-progress", (e) => {
   const patch = {
     ratio,
     state: "sending",
-    statusText: `${p.finishedFiles}/${p.totalFiles} · ${fmtBytes(p.doneBytes)}/${fmtBytes(p.totalBytes)} ${fmtSpeed(p.speedBps)}`,
+    statusText: `${p.finishedFiles}/${p.totalFiles} · ${fmtBytes(p.doneBytes)} / ${fmtBytes(p.totalBytes)}  ${fmtSpeed(p.speedBps)}`,
     cancellable: true,
     onCancel: () => invoke("cancel_receive").catch(() => {}),
   };
   if (existing) {
     Object.assign(existing, patch);
+    renderMessages();
   } else {
     pushMsg(p.fingerprint, {
       _key: key, dir: "in", kind: "files", alias: p.alias,
       files: [], ts: Date.now(), ...patch,
     });
   }
-  renderMessages();
   islandText = `⬇ ${p.alias} ${Math.round(ratio * 100)}%`;
   $("island-status").textContent = islandText;
 });
@@ -866,9 +1007,7 @@ listen("receive-done", (e) => {
     files,
     ratio: 1,
     state: p.reason === "finished" ? "done" : "cancelled",
-    statusText: p.reason === "finished"
-      ? `已接收 ${p.receivedFiles} 个 → ${p.savedTo}`
-      : `已取消(失败 ${p.failedFiles} 个)`,
+    statusText: p.reason === "finished" ? "" : `已取消(失败 ${p.failedFiles} 个)`,
     cancellable: false,
   };
   if (existing) {
@@ -879,6 +1018,7 @@ listen("receive-done", (e) => {
       _key: key, dir: "in", kind: "files", alias: p.alias, ts: Date.now(), ...patch,
     });
   }
+  if (p.reason === "finished") toast(`已收到 ${p.receivedFiles} 个文件`);
   islandText = `⬇ ${p.alias} 完成`;
   $("island-status").textContent = islandText;
 });
@@ -887,7 +1027,7 @@ listen("send-progress", (e) => {
   const p = e.payload;
   const key = `send:${p.sendId}`;
   const ratio = p.totalBytes ? p.doneBytes / p.totalBytes : 0;
-  const zh = { sending: "发送中", done: "完成", failed: "失败", cancelled: "已取消" }[p.state] || p.state;
+  const zh = { sending: "发送中", done: "已送达", failed: "发送失败", cancelled: "已取消" }[p.state] || p.state;
   const msgs = history.get(p.fingerprint) || [];
   const existing = msgs.find((x) => x._key === key);
   const files = (p.files || []).map((f) => ({
@@ -897,8 +1037,10 @@ listen("send-progress", (e) => {
   const patch = {
     ratio,
     state: p.state,
-    statusText: p.kind === "text" ? zh
-      : `${zh} · ${fmtBytes(p.doneBytes)}/${fmtBytes(p.totalBytes)} ${fmtSpeed(p.speedBps)}${p.error ? " · " + p.error : ""}`,
+    statusText: p.kind === "text"
+      ? (p.state === "done" ? "" : zh + (p.error ? ` · ${p.error}` : ""))
+      : p.state === "done" ? ""
+      : `${zh} · ${fmtBytes(p.doneBytes)} / ${fmtBytes(p.totalBytes)}  ${fmtSpeed(p.speedBps)}${p.error ? " · " + p.error : ""}`,
     cancellable: p.state === "sending",
     onCancel: () => invoke("cancel_send", { sendId: p.sendId }).catch(() => {}),
   };
@@ -944,11 +1086,18 @@ listen("message-received", (e) => {
 
 // ---------- 初始化 ----------
 
+scanning = true;
+setTimeout(() => {
+  scanning = false;
+  renderDevices();
+}, 4000);
+
 invoke("list_devices")
   .then((list) => {
     devices = list;
-    renderDeviceBar();
+    if (!selectedFingerprint && devices.length === 1) selectedFingerprint = devices[0].fingerprint;
+    renderDevices();
   })
   .catch(() => {});
 
-renderMessages();
+setView("all");
