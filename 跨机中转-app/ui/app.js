@@ -314,6 +314,7 @@ function linkify(text) {
       e.preventDefault();
       openLink(m[0]);
     };
+    makeDraggable(a, () => ({ url: m[0] }));
     frag.appendChild(a);
     last = m.index + m[0].length;
   }
@@ -393,6 +394,7 @@ function bubbleForFolder(g, dir) {
   if (g.dirPath) {
     head.classList.add("openable");
     head.title = g.dirPath;
+    makeDraggable(head, () => ({ paths: [g.dirPath], icon: dragIcon(null, "DIR", KIND_HEX["c-amber"]) }));
     head.onclick = () =>
       invoke("open_file", { path: g.dirPath }).catch((e) => logLine("error", `打开失败: ${e}`));
   }
@@ -429,6 +431,85 @@ function loadThumb(img, path, onFail) {
     .catch(onFail);
 }
 
+// ---------- 拖出(桌面):把文件/文件夹/图片/链接拖到 Finder、微信、QQ 等 ----------
+// 按住后移动超过阈值才发起原生拖拽,单纯点击仍然是打开。
+// 拖拽期间窗口自己也会收到 drop,用 draggingOut 屏蔽,避免把文件又发出去。
+
+let draggingOut = false;
+let suppressClick = false;
+listen("drag-out-end", () => setTimeout(() => (draggingOut = false), 300));
+
+// 小尺寸拖拽预览图:有缩略图用缩略图,否则画一个类型色块
+function dragIcon(imgEl, label, color) {
+  const S = 64;
+  const c = document.createElement("canvas");
+  c.width = c.height = S;
+  const g = c.getContext("2d");
+  g.beginPath();
+  g.roundRect(2, 2, S - 4, S - 4, 12);
+  g.clip();
+  if (imgEl && imgEl.complete && imgEl.naturalWidth) {
+    const r = Math.max(S / imgEl.naturalWidth, S / imgEl.naturalHeight);
+    const w = imgEl.naturalWidth * r, h = imgEl.naturalHeight * r;
+    g.drawImage(imgEl, (S - w) / 2, (S - h) / 2, w, h);
+  } else {
+    g.fillStyle = color || "#64748b";
+    g.fillRect(0, 0, S, S);
+    g.fillStyle = "#fff";
+    g.font = "800 15px -apple-system, system-ui, sans-serif";
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.fillText(label || "FILE", S / 2, S / 2);
+  }
+  return c.toDataURL("image/png");
+}
+
+const KIND_HEX = {
+  "c-blue": "#3b82f6", "c-green": "#10b981", "c-red": "#ef4444", "c-amber": "#f59e0b",
+  "c-purple": "#8b5cf6", "c-pink": "#ec4899", "c-orange": "#f97316", "c-slate": "#64748b",
+};
+
+// node 上按下鼠标并拖动时发起拖出;getPayload 返回 { paths?, url?, icon? }
+function makeDraggable(node, getPayload) {
+  if (IS_ANDROID) return;
+  node.addEventListener("dragstart", (e) => e.preventDefault());
+  node.addEventListener("mousedown", (e) => {
+    if (e.button !== 0 || e.target.closest("button:not(.g-cell)")) return;
+    const x0 = e.clientX, y0 = e.clientY;
+    const move = (ev) => {
+      if (Math.abs(ev.clientX - x0) + Math.abs(ev.clientY - y0) < 6) return;
+      cleanup();
+      const p = getPayload();
+      if (!p) return;
+      draggingOut = true;
+      suppressClick = true;
+      setTimeout(() => (suppressClick = false), 400);
+      invoke("start_drag_out", { paths: p.paths || [], url: p.url || null, icon: p.icon || null }).catch((err) => {
+        draggingOut = false;
+        logLine("error", `拖出失败: ${err}`);
+      });
+    };
+    const cleanup = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", cleanup);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", cleanup);
+  });
+  // 拖完松手时浏览器可能补发一次 click,吞掉它,别把文件打开
+  node.addEventListener("click", (e) => {
+    if (suppressClick) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
+  }, true);
+}
+
+function fileDragPayload(f, path, imgEl) {
+  const [label, color] = fileKind(f);
+  return () => ({ paths: [path], icon: dragIcon(imgEl, label, KIND_HEX[color]) });
+}
+
 function saveAs(f, path) {
   return async (e) => {
     e.stopPropagation();
@@ -455,11 +536,13 @@ function bubbleForFile(f, dir, compact = false) {
   info.append(el("div", "f-name", f.name), el("div", "f-sub", fmtBytes(f.size || 0)));
   const path = f.savedPath || f.saved_path;
   const badge = kindBadge(f);
+  let thumbEl = null;
 
   // 图片:在气泡里直接显示缩略图,失败回落到类型图标
   if (isImage(f) && path && !compact) {
     card.classList.add("has-thumb");
     const thumb = el("img", "f-thumb");
+    thumbEl = thumb;
     thumb.alt = f.name || "";
     loadThumb(thumb, path, () => {
       thumb.remove();
@@ -475,6 +558,7 @@ function bubbleForFile(f, dir, compact = false) {
     card.title = path;
     card.onclick = () =>
       invoke("open_file", { path }).catch((e) => logLine("error", `打开失败: ${e}`));
+    makeDraggable(card, fileDragPayload(f, path, thumbEl));
     if (!IS_ANDROID && !compact) {
       const saveBtn = el("button", "f-save-as", "另存为");
       saveBtn.title = "保存到其他位置";
@@ -578,6 +662,7 @@ function renderImages(ul, msgs) {
     cell.appendChild(img);
     cell.appendChild(el("span", `g-dir ${m.dir}`, m.dir === "in" ? "收" : "发"));
     cell.onclick = () => invoke("open_file", { path }).catch((e) => logLine("error", `打开失败: ${e}`));
+    makeDraggable(cell, fileDragPayload(f, path, img));
     li.appendChild(cell);
   }
   ul.appendChild(li);
@@ -623,6 +708,7 @@ function renderLinks(ul, msgs) {
     info.append(el("div", "f-name", host), el("div", "f-sub", u));
     row.append(badge, info);
     row.onclick = () => openLink(u);
+    makeDraggable(row, () => ({ url: u }));
     li.appendChild(row);
   }
   ul.appendChild(li);
@@ -886,10 +972,11 @@ document.addEventListener("dragover", (e) => e.preventDefault());
 document.addEventListener("drop", (e) => e.preventDefault());
 
 // macOS 上 wry 用原生 NSDragging 接管拖拽,改用 Tauri 转发的事件做悬停高亮
-listen("tauri://drag-enter", () => $("stage").classList.add("drag-over"));
+listen("tauri://drag-enter", () => !draggingOut && $("stage").classList.add("drag-over"));
 listen("tauri://drag-leave", () => $("stage").classList.remove("drag-over"));
 listen("tauri://drag-drop", (e) => {
   $("stage").classList.remove("drag-over");
+  if (draggingOut) return; // 从本窗口拖出又放回本窗口,不当作发送
   const paths = (e.payload && e.payload.paths) || [];
   if (!paths.length) {
     // 某些拖拽源(快速查看、网页图片)只给非文件 URL,wry 解不出路径

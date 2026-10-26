@@ -72,6 +72,11 @@ features = [
 ]
 default-features = false
 
+# Desktop: start a native OS drag session so received files/links can be
+# dragged out to Finder/Explorer, WeChat, QQ, other apps.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies.drag]
+version = "2.1.1"
+
 [dev-dependencies]
 tauri = { version = "2", features = ["devtools"] }
 

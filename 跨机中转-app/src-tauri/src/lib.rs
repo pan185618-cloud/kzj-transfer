@@ -32,6 +32,7 @@ pub fn run() {
             backend::read_image_preview,
             backend::open_link,
             backend::paste_file_paths,
+            backend::start_drag_out,
             backend::pick_files,
             backend::pick_folder,
             backend::load_history,

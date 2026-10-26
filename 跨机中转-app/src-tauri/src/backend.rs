@@ -1840,6 +1840,82 @@ pub async fn open_link(url: String) -> Result<(), String> {
     open::that_detached(u).map_err(|e| e.to_string())
 }
 
+/// Drag received files/folders (or a link) out of the window into Finder /
+/// Explorer or another app (微信、QQ、Claude…). Must be invoked while the
+/// mouse button is still held: the OS drag session takes over the pointer.
+/// `icon` is a base64 PNG (optionally a data URL) used as the drag image.
+/// Emits `drag-out-end` when the session finishes so the UI can ignore the
+/// drop if the user releases over our own window.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[tauri::command]
+pub fn start_drag_out(
+    window: tauri::WebviewWindow,
+    paths: Vec<String>,
+    url: Option<String>,
+    icon: Option<String>,
+) -> Result<(), String> {
+    let files: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    if let Some(p) = files.iter().find(|p| !p.is_absolute() || !p.exists()) {
+        return Err(format!("文件不存在: {}", p.display()));
+    }
+    let url = url.filter(|u| u.starts_with("http://") || u.starts_with("https://"));
+    if files.is_empty() && url.is_none() {
+        return Err("没有可拖出的内容".to_string());
+    }
+    // Windows: the drag crate cannot carry raw data, only files.
+    #[cfg(target_os = "windows")]
+    if files.is_empty() {
+        return Err("Windows 暂不支持拖出链接".to_string());
+    }
+    let icon_bytes = icon
+        .map(|s| s.rsplit(',').next().unwrap_or_default().to_string())
+        .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| include_bytes!("../icons/32x32.png").to_vec());
+
+    let app = window.app_handle().clone();
+    let win = window.clone();
+    window
+        .run_on_main_thread(move || {
+            let item = if !files.is_empty() {
+                drag::DragItem::Files(files)
+            } else {
+                let link = url.unwrap_or_default();
+                drag::DragItem::Data {
+                    provider: Box::new(move |_ty| Some(link.clone().into_bytes())),
+                    types: vec!["public.url".into(), "public.utf8-plain-text".into()],
+                }
+            };
+            let done = app.clone();
+            let res = drag::start_drag(
+                &win,
+                item,
+                drag::Image::Raw(icon_bytes),
+                move |result, _pos| {
+                    let dropped = matches!(result, drag::DragResult::Dropped);
+                    let _ = done.emit("drag-out-end", dropped);
+                },
+                drag::Options::default(),
+            );
+            if let Err(e) = res {
+                let _ = app.emit("drag-out-end", false);
+                eprintln!("start_drag failed: {e}");
+            }
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[tauri::command]
+pub fn start_drag_out(
+    paths: Vec<String>,
+    url: Option<String>,
+    icon: Option<String>,
+) -> Result<(), String> {
+    let _ = (paths, url, icon);
+    Err("当前平台不支持拖出".to_string())
+}
+
 /// Read absolute file paths off the general pasteboard so that pasting a
 /// copied file (Finder ⌘C → ⌘V in the composer) sends it like a drop.
 /// Returns an empty list when the pasteboard holds no file URLs.
