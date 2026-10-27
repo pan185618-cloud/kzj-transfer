@@ -153,4 +153,6 @@ pub struct SendProgressPayload {
     /// For kind=files: per-file details; saved_path = local source path,
     /// so the UI can preview/ reopen what it sent.
     pub files: Vec<FilePayload>,
+    /// Broadcast id shared by the per-device sends of one user action.
+    pub batch: Option<String>,
 }

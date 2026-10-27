@@ -43,8 +43,12 @@ const COMPACT_W = 320;
 const COMPACT_H = 36;
 
 let devices = [];
-// 发送目标设备(和「按设备」的查看筛选同步,但「全部/按类型」视图下也保留)
+// 「按设备」视图当前查看的设备
 let selectedFingerprint = null;
+// 发送目标:默认所有在线设备都收;用户在「发现设备」里取消勾选的记在 excluded 里
+const excluded = new Set(JSON.parse(localStorage.getItem("excludedTargets") || "[]"));
+const saveExcluded = () => localStorage.setItem("excludedTargets", JSON.stringify([...excluded]));
+const targetDevices = () => devices.filter((d) => !excluded.has(d.fingerprint));
 let pendingRequest = null;
 let islandText = "中转";
 // 消息历史: fingerprint -> [{dir,kind,text,files,alias,ts,state,ratio,statusText}]
@@ -140,35 +144,47 @@ function renderDevices() {
   $("brand-sub").classList.toggle("on", n > 0);
 
   // 发送目标
-  const target = deviceByFp(selectedFingerprint);
-  $("target").classList.toggle("hidden", !target);
-  if (target) $("target-name").textContent = target.alias;
+  const ts = targetDevices();
+  $("target").classList.toggle("hidden", n === 0);
+  $("target-name").textContent =
+    ts.length === 0 ? "未选设备"
+    : ts.length === n && n > 1 ? `全部 ${n} 台设备`
+    : ts.map((d) => d.alias).join("、");
 
   renderDevList();
   renderSubDevice();
   renderMessages();
 }
 
+// 「按设备」视图切换查看的设备
 function selectDevice(fp) {
   selectedFingerprint = fp;
   renderDevices();
-  // 文件已选好、在等设备:选定后自动发出
-  if (pendingPaths && fp) {
+}
+
+// 发现设备面板里勾选/取消一台设备作为发送目标
+function toggleTarget(fp) {
+  if (excluded.has(fp)) excluded.delete(fp);
+  else excluded.add(fp);
+  saveExcluded();
+  renderDevices();
+  flushPending();
+}
+
+// 文件已选好、在等设备:有目标后自动发出
+function flushPending() {
+  if (pendingPaths && targetDevices().length) {
     const { paths, picked } = pendingPaths;
     pendingPaths = null;
     sendPaths(paths, picked);
   }
 }
 
-// 当前发送目标;未选时若只有一台在线设备就默认它,否则打开「发现设备」
+// 当前发送目标(可多台);一台都没有时打开「发现设备」
 function ensureTarget() {
-  if (selectedFingerprint && deviceByFp(selectedFingerprint)) return true;
-  if (devices.length === 1) {
-    selectDevice(devices[0].fingerprint);
-    return true;
-  }
+  if (targetDevices().length) return true;
   openSheet();
-  toast(devices.length ? "先选一台要发送的设备" : "还没有发现设备");
+  toast(devices.length ? "先勾选要发送的设备" : "还没有发现设备");
   return false;
 }
 
@@ -179,7 +195,7 @@ function renderDevList() {
   list.innerHTML = "";
   $("dev-empty").classList.toggle("hidden", devices.length > 0);
   for (const d of devices) {
-    const li = el("li", "dev-item" + (d.fingerprint === selectedFingerprint ? " selected" : ""));
+    const li = el("li", "dev-item" + (!excluded.has(d.fingerprint) ? " selected" : ""));
     const icon = el("span", "dev-icon");
     icon.innerHTML = deviceIcon(d);
     const info = el("span", "dev-info");
@@ -187,10 +203,7 @@ function renderDevList() {
     const check = el("span", "dev-check");
     check.innerHTML = '<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
     li.append(icon, info, check);
-    li.onclick = () => {
-      selectDevice(d.fingerprint);
-      closeSheet();
-    };
+    li.onclick = () => toggleTarget(d.fingerprint);
     list.appendChild(li);
   }
 }
@@ -615,11 +628,49 @@ function msgNode(m) {
 
 function allMsgs(filterFp = null) {
   const out = [];
+  const batches = new Map();
   for (const [fp, msgs] of history) {
     if (filterFp && fp !== filterFp) continue;
-    for (const m of msgs) out.push(m);
+    for (const m of msgs) {
+      // 同一次群发到多台设备的记录,不按设备筛选时合并成一条
+      if (!filterFp && m.batch && m.dir === "out") {
+        if (!batches.has(m.batch)) {
+          batches.set(m.batch, []);
+          out.push({ _batch: m.batch, ts: m.ts });
+        }
+        batches.get(m.batch).push(m);
+        continue;
+      }
+      out.push(m);
+    }
   }
-  return out.sort((a, b) => a.ts - b.ts);
+  return out
+    .map((m) => (m._batch ? mergeBatch(batches.get(m._batch)) : m))
+    .sort((a, b) => a.ts - b.ts);
+}
+
+const STATE_ZH = { sending: "发送中", done: "已送达", failed: "失败", cancelled: "已取消" };
+
+function mergeBatch(parts) {
+  if (parts.length === 1) return parts[0];
+  const first = parts.reduce((a, b) => (a.ts <= b.ts ? a : b));
+  const any = (st) => parts.some((p) => p.state === st);
+  const all = (st) => parts.every((p) => p.state === st);
+  const state = any("sending") ? "sending" : all("done") ? "done" : any("failed") ? "failed" : any("cancelled") ? "cancelled" : "done";
+  const statusText = state === "done" ? "" : parts
+    .map((p) => `${p.alias} ${p.state === "sending" ? Math.round((p.ratio || 0) * 100) + "%" : STATE_ZH[p.state] || ""}`)
+    .join(" · ");
+  const sending = parts.filter((p) => p.state === "sending" && p.onCancel);
+  return {
+    ...first,
+    alias: parts.map((p) => p.alias).join("、"),
+    files: parts.find((p) => (p.files || []).length)?.files || first.files,
+    state,
+    statusText,
+    ratio: parts.reduce((s, p) => s + (p.state === "sending" ? p.ratio || 0 : 1), 0) / parts.length,
+    cancellable: sending.length > 0,
+    onCancel: () => sending.forEach((p) => p.onCancel()),
+  };
 }
 
 function dayDivider(ts) {
@@ -778,7 +829,7 @@ function hasMessages() {
 
 // ---------- 持久化:重启后记录还在 ----------
 // 只存已结束的消息(传输中的有回调,重启后也无法继续);每台设备最多留 500 条。
-const KEEP_FIELDS = ["dir", "kind", "text", "files", "alias", "ts", "state", "statusText"];
+const KEEP_FIELDS = ["dir", "kind", "text", "files", "alias", "ts", "state", "statusText", "batch"];
 const MAX_PER_DEVICE = 500;
 let historyLoaded = false;
 let saveTimer = null;
@@ -836,14 +887,23 @@ async function doSendText() {
   const text = $("composer-input").value.trim();
   if (!text) return;
   if (!ensureTarget()) return;
-  try {
-    await invoke("send_text", { fingerprint: selectedFingerprint, text });
+  const batch = newBatch();
+  const results = await Promise.allSettled(
+    targetDevices().map((d) =>
+      invoke("send_text", { fingerprint: d.fingerprint, text, batch }).catch((err) => {
+        logLine("error", `发给 ${d.alias} 失败: ${err}`);
+        throw err;
+      })
+    )
+  );
+  if (results.some((r) => r.status === "fulfilled")) {
     $("composer-input").value = "";
     autosize();
-  } catch (err) {
-    logLine("error", `发送失败: ${err}`);
   }
 }
+
+// 一次发送动作的编号:发给多台设备时,各设备的记录共用它,「全部」视图里合并成一个气泡
+const newBatch = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
 
 $("composer-send").onclick = doSendText;
 $("composer-input").addEventListener("keydown", (e) => {
@@ -900,14 +960,17 @@ async function sendPaths(paths, picked = null) {
   if (!ensureTarget()) {
     pendingPaths = { paths, picked };
     const n = (picked && picked.length) || (paths || []).length;
-    toast(`已选 ${n} 项,选好设备后自动发送`);
+    toast(`已选 ${n} 项,勾选设备后自动发送`);
     return;
   }
-  try {
-    await invoke("send_files", { fingerprint: selectedFingerprint, paths: paths || [], picked });
-  } catch (err) {
-    logLine("error", `发送失败: ${err}`);
-  }
+  const batch = newBatch();
+  await Promise.allSettled(
+    targetDevices().map((d) =>
+      invoke("send_files", { fingerprint: d.fingerprint, paths: paths || [], picked, batch }).catch((err) =>
+        logLine("error", `发给 ${d.alias} 失败: ${err}`)
+      )
+    )
+  );
 }
 
 // 文件夹按钮 → 菜单:选择文件 / 选择文件夹
@@ -1097,6 +1160,7 @@ listen("devices-changed", (e) => {
   }
   if (!selectedFingerprint && devices.length === 1) selectedFingerprint = devices[0].fingerprint;
   renderDevices();
+  flushPending();
 });
 
 listen("log", (e) => logLine(e.payload.category, e.payload.text));
@@ -1190,6 +1254,7 @@ listen("send-progress", (e) => {
     cancellable: p.state === "sending",
     onCancel: () => invoke("cancel_send", { sendId: p.sendId }).catch(() => {}),
   };
+  if (p.batch) patch.batch = p.batch;
   if (files.length) patch.files = files;
   if (existing) {
     Object.assign(existing, patch);

@@ -235,6 +235,8 @@ struct SendTask {
     by_peer: Arc<std::sync::atomic::AtomicBool>,
     session_id: Mutex<Option<String>>,
     host: String,
+    /// Groups the per-device sends of one broadcast so the UI shows one bubble.
+    batch: Option<String>,
 }
 
 pub struct AppState {
@@ -1122,6 +1124,7 @@ async fn run_send(
                     kind: task.kind.to_string(),
                     text_preview: task.text_preview.clone(),
                     files: task.files_payload.clone(),
+                    batch: task.batch.clone(),
                 },
             );
         }};
@@ -1146,6 +1149,7 @@ async fn run_send(
                     kind: task.kind.to_string(),
                     text_preview: task.text_preview.clone(),
                     files: task.files_payload.clone(),
+                    batch: task.batch.clone(),
                 },
             );
         }
@@ -1335,6 +1339,7 @@ async fn run_send(
         let kind2 = task.kind;
         let tp2 = task.text_preview.clone();
         let files2 = task.files_payload.clone();
+        let batch2 = task.batch.clone();
         let mut sent_of_file = 0u64;
         let stream = content.into_stream().map(move |chunk| {
             let chunk = chunk?;
@@ -1356,6 +1361,7 @@ async fn run_send(
                     kind: kind2.to_string(),
                     text_preview: tp2.clone(),
                     files: files2.clone(),
+                    batch: batch2.clone(),
                 },
             );
             Ok::<Bytes, anyhow::Error>(chunk)
@@ -1463,6 +1469,7 @@ pub async fn send_files(
     fingerprint: String,
     paths: Vec<String>,
     picked: Option<Vec<AndroidPickItem>>,
+    batch: Option<String>,
 ) -> Result<String, String> {
     let device = state
         .discovery
@@ -1536,6 +1543,7 @@ pub async fn send_files(
             .and_then(|c| c.http())
             .map(|h| h.host.clone())
             .unwrap_or_default(),
+        batch,
     });
     state
         .sends
@@ -1558,6 +1566,7 @@ pub async fn send_text(
     state: State<'_, Arc<AppState>>,
     fingerprint: String,
     text: String,
+    batch: Option<String>,
 ) -> Result<String, String> {
     let device = state
         .discovery
@@ -1601,6 +1610,7 @@ pub async fn send_text(
             .and_then(|c| c.http())
             .map(|h| h.host.clone())
             .unwrap_or_default(),
+        batch,
     });
     state
         .sends
@@ -1862,11 +1872,27 @@ pub fn start_drag_out(
     if files.is_empty() && url.is_none() {
         return Err("没有可拖出的内容".to_string());
     }
-    // Windows: the drag crate cannot carry raw data, only files.
+    // Windows: the drag crate cannot carry raw data, only files — drag a
+    // temporary .url Internet Shortcut instead, which Explorer, browsers and
+    // chat apps all accept as a link.
     #[cfg(target_os = "windows")]
-    if files.is_empty() {
-        return Err("Windows 暂不支持拖出链接".to_string());
-    }
+    let (files, url) = if files.is_empty() {
+        let link = url.clone().unwrap_or_default();
+        let host = link
+            .split("://")
+            .nth(1)
+            .and_then(|r| r.split(['/', '?', '#']).next())
+            .unwrap_or("link")
+            .replace(':', "_");
+        let dir = std::env::temp_dir().join("kuajizhongzhuan-links");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{host}.url"));
+        std::fs::write(&path, format!("[InternetShortcut]\r\nURL={link}\r\n"))
+            .map_err(|e| e.to_string())?;
+        (vec![path], url)
+    } else {
+        (files, url)
+    };
     let icon_bytes = icon
         .map(|s| s.rsplit(',').next().unwrap_or_default().to_string())
         .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
