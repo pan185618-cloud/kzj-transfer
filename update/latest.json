@@ -1,0 +1,8 @@
+{
+  "version": "0.2.0",
+  "notes": "· 修复:拖出图片/文件到 Finder 文件夹只有第一次成功\n· 手机端:一次发送,所有勾选的设备都能收到\n· 新增:粘贴剪贴板内容(文件/截图直接发送,文字填入输入框)\n· 新增:自动检查更新",
+  "page": "https://github.com/pan185618-cloud/kzj-transfer/releases/latest",
+  "mac": "https://github.com/pan185618-cloud/kzj-transfer/releases/latest",
+  "windows": "https://github.com/pan185618-cloud/kzj-transfer/releases/latest",
+  "android": "https://github.com/pan185618-cloud/kzj-transfer/releases/latest/download/kzj-transfer-android-arm64.apk"
+}

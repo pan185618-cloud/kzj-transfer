@@ -75,6 +75,13 @@
 
   <div id="toasts" class="toasts"></div>
 
+  <!-- 有新版本时的提示条 -->
+  <div id="update-bar" class="update-bar hidden">
+    <span class="update-text"><b id="update-title"></b><small id="update-notes"></small></span>
+    <button id="update-later" class="ghost-btn" type="button">稍后</button>
+    <button id="update-go" class="primary-btn" type="button">下载更新</button>
+  </div>
+
   <!-- 底部:输入框 -->
   <footer id="composer">
     <div id="target" class="target hidden">
@@ -87,6 +94,10 @@
       </button>
       <div class="input-wrap">
         <textarea id="composer-input" rows="1" placeholder="输入文字或链接"></textarea>
+        <button id="btn-paste" class="paste-btn" type="button" title="粘贴剪贴板内容(文件/图片直接发送)">
+          <svg viewBox="0 0 24 24"><rect x="5.5" y="4.5" width="13" height="16" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 4.5V4a1.5 1.5 0 0 1 1.5-1.5h3A1.5 1.5 0 0 1 15 4v.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 11h6M9 15h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          <span>粘贴</span>
+        </button>
       </div>
       <button id="composer-send" class="send-btn" title="发送">
         <svg viewBox="0 0 24 24"><path d="M4.5 12 3 4.5 21 12 3 19.5 4.5 12Zm0 0H11" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -173,6 +184,10 @@
     <div class="set-row">
       <span>聊天记录<small>重启后保留,已收到的文件不受影响</small></span>
       <button id="set-clear" class="ghost-btn danger-btn" type="button">清空</button>
+    </div>
+    <div class="set-row">
+      <span><div>版本 <b id="set-version">-</b></div><small id="set-update-status">启动时和每 6 小时自动检查</small></span>
+      <button id="set-check-update" class="ghost-btn" type="button">检查更新</button>
     </div>
     <p class="hint">设备名保存后重启应用生效。<br>指纹 <code id="set-fp"></code></p>
     <div class="dialog-actions">

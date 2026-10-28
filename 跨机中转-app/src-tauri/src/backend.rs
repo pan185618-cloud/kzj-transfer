@@ -2019,6 +2019,219 @@ fn paste_file_paths_impl() -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }
 
+/// 剪贴板内容:文件路径(Finder 复制)、图片(截图/网页图片,已存成临时 PNG)
+/// 或文字。优先级 文件 > 图片 > 文字,和系统粘贴的直觉一致。
+#[derive(Serialize, Default)]
+pub struct ClipboardPayload {
+    files: Vec<String>,
+    image: Option<String>,
+    text: Option<String>,
+    /// Android:剪贴板里是图片/文件时给 content:// URI,按选择器同样的方式发送
+    picked: Vec<AndroidPickItem>,
+}
+
+#[tauri::command]
+pub async fn read_clipboard() -> Result<ClipboardPayload, String> {
+    #[cfg(target_os = "android")]
+    {
+        return android_read_clipboard();
+    }
+    #[allow(unreachable_code)]
+    let files = paste_file_paths_impl()?;
+    if !files.is_empty() {
+        return Ok(ClipboardPayload { files, ..Default::default() });
+    }
+    if let Some(png) = clipboard_image_png() {
+        let dir = std::env::temp_dir().join("kuajizhongzhuan-paste");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!("粘贴的图片_{secs}.png"));
+        std::fs::write(&path, png).map_err(|e| e.to_string())?;
+        return Ok(ClipboardPayload {
+            image: Some(path.display().to_string()),
+            ..Default::default()
+        });
+    }
+    Ok(ClipboardPayload {
+        text: clipboard_text(),
+        ..Default::default()
+    })
+}
+
+/// macOS:剪贴板里的 PNG 直接用,TIFF(截图、多数 app 复制图片)转成 PNG。
+#[cfg(target_os = "macos")]
+fn clipboard_image_png() -> Option<Vec<u8>> {
+    use objc2_app_kit::{
+        NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypePNG,
+        NSPasteboardTypeTIFF,
+    };
+    use objc2_foundation::NSDictionary;
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+        if let Some(d) = pb.dataForType(NSPasteboardTypePNG) {
+            return Some(d.to_vec());
+        }
+        let tiff = pb.dataForType(NSPasteboardTypeTIFF)?;
+        let rep = NSBitmapImageRep::imageRepWithData(&tiff)?;
+        let png = rep.representationUsingType_properties(
+            NSBitmapImageFileType::PNG,
+            &NSDictionary::new(),
+        )?;
+        Some(png.to_vec())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clipboard_text() -> Option<String> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    unsafe {
+        NSPasteboard::generalPasteboard()
+            .stringForType(NSPasteboardTypeString)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// Android:ClipboardManager.getPrimaryClip()。app 在前台时系统允许读取。
+/// 条目带 URI(复制的图片/文件)就返回 URI,否则 coerceToText 取文字。
+#[cfg(target_os = "android")]
+fn android_read_clipboard() -> Result<ClipboardPayload, String> {
+    use jni::objects::{JObject, JValue};
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    wry::prelude::dispatch(move |env, activity, _webview| {
+        let r: Result<ClipboardPayload, String> = (|| {
+            let name = env.new_string("clipboard").map_err(|e| e.to_string())?;
+            let cm = env
+                .call_method(
+                    activity,
+                    "getSystemService",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                    &[JValue::Object(&name.into())],
+                )
+                .and_then(|v| v.l())
+                .map_err(|e| format!("getSystemService: {e}"))?;
+            let clip = env
+                .call_method(&cm, "getPrimaryClip", "()Landroid/content/ClipData;", &[])
+                .and_then(|v| v.l())
+                .map_err(|e| format!("getPrimaryClip: {e}"))?;
+            let mut out = ClipboardPayload::default();
+            if clip.is_null() {
+                return Ok(out);
+            }
+            let count = env
+                .call_method(&clip, "getItemCount", "()I", &[])
+                .and_then(|v| v.i())
+                .map_err(|e| e.to_string())?;
+            let resolver = env
+                .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])
+                .and_then(|v| v.l())
+                .map_err(|e| e.to_string())?;
+            let mut texts = Vec::new();
+            for i in 0..count {
+                let item = env
+                    .call_method(&clip, "getItemAt", "(I)Landroid/content/ClipData$Item;", &[JValue::Int(i)])
+                    .and_then(|v| v.l())
+                    .map_err(|e| e.to_string())?;
+                let uri = env
+                    .call_method(&item, "getUri", "()Landroid/net/Uri;", &[])
+                    .and_then(|v| v.l())
+                    .map_err(|e| e.to_string())?;
+                if !uri.is_null() {
+                    let us = env
+                        .call_method(&uri, "toString", "()Ljava/lang/String;", &[])
+                        .and_then(|v| v.l())
+                        .map_err(|e| e.to_string())?;
+                    let us: String = env.get_string(&us.into()).map_err(|e| e.to_string())?.into();
+                    if us.starts_with("content://") {
+                        let mime = env
+                            .call_method(&resolver, "getType", "(Landroid/net/Uri;)Ljava/lang/String;", &[JValue::Object(&uri)])
+                            .and_then(|v| v.l())
+                            .ok()
+                            .filter(|o| !o.is_null())
+                            .and_then(|o| env.get_string(&o.into()).ok().map(String::from));
+                        if env.exception_check().unwrap_or(false) {
+                            let _ = env.exception_clear();
+                        }
+                        let tail = us.rsplit('/').next().unwrap_or("file").to_string();
+                        let ext = mime
+                            .as_deref()
+                            .and_then(|m| mime_guess::get_mime_extensions_str(m))
+                            .and_then(|e| e.first())
+                            .map(|e| format!(".{e}"))
+                            .unwrap_or_default();
+                        let name = if tail.contains('.') { tail } else { format!("粘贴的文件_{tail}{ext}") };
+                        out.picked.push(AndroidPickItem { uri: us, name: Some(name), size: None, mime_type: mime });
+                        continue;
+                    }
+                }
+                let cs = env
+                    .call_method(&item, "coerceToText", "(Landroid/content/Context;)Ljava/lang/CharSequence;", &[JValue::Object(activity)])
+                    .and_then(|v| v.l())
+                    .map_err(|e| e.to_string())?;
+                if !cs.is_null() {
+                    let js = env
+                        .call_method(&cs, "toString", "()Ljava/lang/String;", &[])
+                        .and_then(|v| v.l())
+                        .map_err(|e| e.to_string())?;
+                    let t: String = env.get_string(&JObject::from(js).into()).map_err(|e| e.to_string())?.into();
+                    if !t.is_empty() {
+                        texts.push(t);
+                    }
+                }
+            }
+            if out.picked.is_empty() && !texts.is_empty() {
+                out.text = Some(texts.join("\n"));
+            }
+            Ok(out)
+        })();
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        let _ = tx.send(r);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| "读取剪贴板超时".to_string())?
+}
+
+// Windows:网页视图自己能读到剪贴板里的图片和文字(前端走
+// navigator.clipboard / paste 事件),这里不重复实现。
+#[cfg(not(target_os = "macos"))]
+fn clipboard_image_png() -> Option<Vec<u8>> {
+    None
+}
+#[cfg(not(target_os = "macos"))]
+fn clipboard_text() -> Option<String> {
+    None
+}
+
+/// 前端从网页剪贴板拿到的图片字节(Windows/Android),存成临时文件再按文件发送。
+#[tauri::command]
+pub async fn save_pasted_image(data_base64: String, ext: Option<String>) -> Result<String, String> {
+    let raw = data_base64.rsplit(',').next().unwrap_or_default();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|e| format!("图片数据无效: {e}"))?;
+    if bytes.is_empty() {
+        return Err("剪贴板图片为空".to_string());
+    }
+    let ext = ext
+        .filter(|e| e.chars().all(|c| c.is_ascii_alphanumeric()) && e.len() <= 5)
+        .unwrap_or_else(|| "png".to_string());
+    let dir = std::env::temp_dir().join("kuajizhongzhuan-paste");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("粘贴的图片_{secs}.{ext}"));
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
+}
+
 #[tauri::command]
 pub async fn refresh_devices(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let interface_ips =
@@ -2188,4 +2401,150 @@ pub async fn clear_history() -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+// ---------- 检查更新 ----------
+// 版本清单放在 GitHub 仓库 main 分支的 `update/latest.json`,发版时改它即可:
+// { "version": "0.2.0", "notes": "...", "mac": url, "windows": url, "android": url }
+// 先走 jsDelivr(国内可达),失败再走 raw.githubusercontent。
+
+const UPDATE_URLS: &[&str] = &[
+    "https://cdn.jsdelivr.net/gh/pan185618-cloud/kzj-transfer@main/update/latest.json",
+    "https://raw.githubusercontent.com/pan185618-cloud/kzj-transfer/main/update/latest.json",
+];
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    current: String,
+    latest: String,
+    available: bool,
+    notes: String,
+    /// 本平台的下载地址;没有时为空,UI 退回打开发布页
+    url: String,
+    page: String,
+}
+
+fn version_tuple(v: &str) -> Vec<u64> {
+    v.trim_start_matches('v')
+        .split(['.', '-', '+'])
+        .take(3)
+        .map(|p| p.parse().unwrap_or(0))
+        .collect()
+}
+
+#[tauri::command]
+pub async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
+    let current = app.package_info().version.to_string();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut last_err = String::new();
+    let mut manifest: Option<serde_json::Value> = None;
+    for url in UPDATE_URLS {
+        // jsDelivr 有缓存,带时间戳参数只对 raw 有用;两边都无害
+        let u = format!("{url}?t={}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / 600)
+            .unwrap_or(0));
+        match client.get(&u).send().await {
+            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                Ok(v) => {
+                    manifest = Some(v);
+                    break;
+                }
+                Err(e) => last_err = e.to_string(),
+            },
+            Ok(r) => last_err = format!("HTTP {}", r.status()),
+            Err(e) => last_err = error_chain(&e),
+        }
+    }
+    let m = manifest.ok_or_else(|| format!("检查更新失败: {last_err}"))?;
+    let latest = m["version"].as_str().unwrap_or("").to_string();
+    if latest.is_empty() {
+        return Err("更新清单缺少 version".to_string());
+    }
+    let platform = if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "mac"
+    };
+    Ok(UpdateInfo {
+        available: version_tuple(&latest) > version_tuple(&current),
+        current,
+        notes: m["notes"].as_str().unwrap_or("").to_string(),
+        url: m[platform].as_str().unwrap_or("").to_string(),
+        page: m["page"]
+            .as_str()
+            .unwrap_or("https://github.com/pan185618-cloud/kzj-transfer/releases")
+            .to_string(),
+        latest,
+    })
+}
+
+/// Android 没有浏览器式的 open::that,用 ACTION_VIEW 交给系统浏览器下载 APK。
+/// 桌面直接打开链接。
+#[tauri::command]
+pub async fn open_update_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("不是有效链接".to_string());
+    }
+    #[cfg(target_os = "android")]
+    {
+        return android_view_url(url);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        open::that_detached(&url).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_view_url(url: String) -> Result<(), String> {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    wry::prelude::dispatch(move |env, activity, _webview| {
+        let r: Result<(), String> = (|| {
+            let s = env.new_string(&url).map_err(|e| e.to_string())?;
+            let uri = env
+                .call_static_method(
+                    "android/net/Uri",
+                    "parse",
+                    "(Ljava/lang/String;)Landroid/net/Uri;",
+                    &[jni::objects::JValue::Object(&s.into())],
+                )
+                .and_then(|v| v.l())
+                .map_err(|e| e.to_string())?;
+            let action = env
+                .new_string("android.intent.action.VIEW")
+                .map_err(|e| e.to_string())?;
+            let intent = env
+                .new_object(
+                    "android/content/Intent",
+                    "(Ljava/lang/String;Landroid/net/Uri;)V",
+                    &[
+                        jni::objects::JValue::Object(&action.into()),
+                        jni::objects::JValue::Object(&uri),
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            env.call_method(
+                activity,
+                "startActivity",
+                "(Landroid/content/Intent;)V",
+                &[jni::objects::JValue::Object(&intent)],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        let _ = tx.send(r);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| "打开浏览器超时".to_string())?
 }

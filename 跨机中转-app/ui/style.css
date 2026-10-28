@@ -394,6 +394,22 @@ body.android .toasts { top: calc(80px + max(var(--safe-top), 28px)); }
 .toast.out { opacity: 0; transform: translateY(-6px); }
 @keyframes drop { from { opacity: 0; transform: translateY(-8px); } }
 
+/* ---------- 更新提示条 ---------- */
+
+.update-bar {
+  position: fixed; left: 50%; bottom: calc(92px + var(--safe-bottom)); transform: translateX(-50%);
+  z-index: 55; display: flex; align-items: center; gap: 8px;
+  width: calc(100% - 32px); max-width: 480px; padding: 10px 10px 10px 14px;
+  background: var(--surface-glass); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--accent-ring); border-radius: 14px; box-shadow: var(--shadow-2);
+  animation: drop .25s ease-out;
+}
+.update-bar.hidden { display: none; }
+.update-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: 13px; color: var(--text); }
+.update-text small { font-size: 11.5px; color: var(--text-2); white-space: pre-line; max-height: 4.5em; overflow: auto; }
+.update-bar .ghost-btn, .update-bar .primary-btn { height: 32px; padding: 0 12px; font-size: 13px; flex: 0 0 auto; }
+body.compact .update-bar { display: none !important; }
+
 /* ---------- 输入区 ---------- */
 
 #composer {
@@ -426,7 +442,7 @@ body.android #composer { padding-bottom: calc(12px + max(var(--safe-bottom), 16p
 .attach-btn:active { transform: scale(.94); }
 
 .input-wrap {
-  flex: 1; min-width: 0;
+  flex: 1; min-width: 0; display: flex; align-items: flex-end;
   background: var(--surface);
   border: 1px solid var(--line-strong);
   border-radius: 14px;
@@ -434,12 +450,21 @@ body.android #composer { padding-bottom: calc(12px + max(var(--safe-bottom), 16p
 }
 .input-wrap:focus-within { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
 #composer textarea {
-  display: block; width: 100%;
+  display: block; flex: 1; min-width: 0; width: 100%;
   border: none; background: transparent; color: var(--text);
   padding: 11px 14px; font-size: 15px; font-family: inherit;
   resize: none; max-height: 120px; line-height: 1.45; min-height: 42px;
 }
 #composer textarea:focus { outline: none; }
+.paste-btn {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 4px;
+  height: 30px; margin: 6px 6px 6px 0; padding: 0 9px;
+  border: none; border-radius: 9px; background: var(--surface-2);
+  color: var(--text-2); font-size: 12.5px; font-family: inherit; cursor: pointer;
+}
+.paste-btn svg { width: 16px; height: 16px; }
+.paste-btn:hover, .paste-btn:active { color: var(--accent); background: var(--accent-soft); }
+#composer.has-text .paste-btn span, body.android .paste-btn span { display: none; }
 #composer textarea::placeholder { color: var(--text-3); }
 
 .send-btn {

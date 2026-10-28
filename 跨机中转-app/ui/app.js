@@ -486,6 +486,10 @@ const KIND_HEX = {
 function makeDraggable(node, getPayload) {
   if (IS_ANDROID) return;
   node.addEventListener("dragstart", (e) => e.preventDefault());
+  // 不让 WebKit 发起它自己的网页拖拽(图片/文字默认可拖):它被 dragstart 取消时
+  // 会清空系统拖拽剪贴板,而我们的原生拖拽正用着它,Finder 收到空内容就拒绝放下。
+  node.style.webkitUserDrag = "none";
+  node.querySelectorAll("img").forEach((i) => (i.draggable = false));
   node.addEventListener("mousedown", (e) => {
     if (e.button !== 0 || e.target.closest("button:not(.g-cell)")) return;
     const x0 = e.clientX, y0 = e.clientY;
@@ -922,37 +926,122 @@ function autosize() {
 }
 $("composer-input").addEventListener("input", autosize);
 
-// 粘贴(桌面):剪贴板里若是 Finder ⌘C 复制的文件,WKWebView 不给绝对路径,
-// 走原生命令读 NSPasteboard 拿到真实路径后按拖拽同路径发送。
+// ---------- 粘贴 / 读取剪贴板 ----------
+// 输入框里 ⌘V/Ctrl+V,或点「粘贴」按钮:剪贴板里是文件就发文件,是图片(截图、
+// 网页图片)就存成 PNG 发出去,是文字就填进输入框。
+// macOS 上 WKWebView 拿不到文件绝对路径和截图,走原生命令读 NSPasteboard;
+// Windows/Android 用网页剪贴板里的图片字节。
+
+function insertText(text) {
+  const ta = $("composer-input");
+  const s = ta.selectionStart ?? ta.value.length;
+  const t = ta.selectionEnd ?? s;
+  ta.value = ta.value.slice(0, s) + text + ta.value.slice(t);
+  ta.selectionStart = ta.selectionEnd = s + text.length;
+  ta.focus();
+  setTimeout(autosize, 0);
+}
+
+const blobToDataUrl = (blob) =>
+  new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+
+async function sendImageBlob(blob) {
+  const ext = ((blob.type || "image/png").split("/")[1] || "png").replace("jpeg", "jpg");
+  const path = await invoke("save_pasted_image", { dataBase64: await blobToDataUrl(blob), ext });
+  sendPaths([path]);
+}
+
+// 原生读取:返回 true 表示已处理(发了文件/图片)
+async function pasteNative() {
+  let c = null;
+  try {
+    c = await invoke("read_clipboard");
+  } catch (_) {
+    return false;
+  }
+  if (c.files && c.files.length) {
+    sendPaths(c.files);
+    return true;
+  }
+  if (c.picked && c.picked.length) {
+    sendPaths([], c.picked);
+    return true;
+  }
+  if (c.image) {
+    sendPaths([c.image]);
+    return true;
+  }
+  if (c.text) {
+    insertText(c.text);
+    return true;
+  }
+  return false;
+}
+
 $("composer-input").addEventListener("paste", (e) => {
-  if (IS_ANDROID) return; // 手机上按系统默认粘贴文本
-  const hasFiles = e.clipboardData &&
-    (e.clipboardData.files.length > 0 ||
-     Array.from(e.clipboardData.items || []).some((it) => it.kind === "file"));
+  const cd = e.clipboardData;
+  const img = cd && Array.from(cd.items || []).find((it) => it.kind === "file" && it.type.startsWith("image/"));
+  const text = (cd && cd.getData("text/plain")) || "";
+  if (IS_ANDROID) {
+    // 手机:文字交给系统默认粘贴;图片自己接住发出去
+    if (img && !text) {
+      e.preventDefault();
+      sendImageBlob(img.getAsFile()).catch((err) => toast(`粘贴图片失败: ${err}`, "err"));
+    }
+    return;
+  }
   e.preventDefault();
   (async () => {
-    let paths = [];
-    try {
-      paths = (await invoke("paste_file_paths")) || [];
-    } catch (_) {
-      // 非 macOS 或失败时退回纯文本粘贴
-    }
-    if (paths.length > 0) {
-      sendPaths(paths);
-    } else {
-      const ta = $("composer-input");
-      const text = (e.clipboardData && e.clipboardData.getData("text/plain")) || "";
-      if (text) {
-        const s = ta.selectionStart ?? ta.value.length;
-        const t = ta.selectionEnd ?? s;
-        ta.value = ta.value.slice(0, s) + text + ta.value.slice(t);
-        ta.selectionStart = ta.selectionEnd = s + text.length;
+    if (await pasteNative()) return;
+    if (img) {
+      try {
+        await sendImageBlob(img.getAsFile());
+        return;
+      } catch (err) {
+        toast(`粘贴图片失败: ${err}`, "err");
       }
-      if (hasFiles) logLine("error", "剪贴板里有文件但拿不到路径,请改用拖拽或文件夹按钮选择");
-      setTimeout(autosize, 0);
     }
+    if (text) insertText(text);
+    else if (cd && cd.files && cd.files.length) toast("剪贴板里有文件但拿不到路径,请改用拖拽或文件夹按钮选择", "err");
   })();
 });
+
+// 「粘贴」按钮:不用先点输入框,直接读剪贴板
+async function pasteFromButton() {
+  if (await pasteNative()) return;
+  try {
+    if (navigator.clipboard && navigator.clipboard.read) {
+      const items = await navigator.clipboard.read();
+      for (const it of items) {
+        const t = it.types.find((x) => x.startsWith("image/"));
+        if (t) {
+          await sendImageBlob(await it.getType(t));
+          return;
+        }
+      }
+      for (const it of items) {
+        if (it.types.includes("text/plain")) {
+          const text = await (await it.getType("text/plain")).text();
+          if (text) return insertText(text);
+        }
+      }
+    } else if (navigator.clipboard && navigator.clipboard.readText) {
+      const text = await navigator.clipboard.readText();
+      if (text) return insertText(text);
+    }
+    toast("剪贴板是空的");
+  } catch (err) {
+    // 系统拒绝网页读剪贴板时,退回让用户在输入框里长按粘贴
+    $("composer-input").focus();
+    toast(IS_ANDROID ? "请在输入框里长按,选择「粘贴」" : `读取剪贴板失败: ${err}`);
+  }
+}
+$("btn-paste").onclick = () => pasteFromButton().catch((e) => toast(`${e}`, "err"));
 
 // 统一发送入口:路径数组(桌面)或 Android 选择器给的 picked 对象数组。
 async function sendPaths(paths, picked = null) {
@@ -1149,6 +1238,56 @@ $("set-browse").onclick = async () => {
     logLine("error", `选择目录失败: ${e}`);
   }
 };
+
+// ---------- 检查更新 ----------
+// 启动 5 秒后检查一次,之后每 6 小时一次。同一版本点了「稍后」就不再弹条,
+// 但设置里仍显示有新版本。
+
+let updateInfo = null;
+const UPDATE_EVERY = 6 * 3600 * 1000;
+
+async function checkUpdate(manual = false) {
+  const status = $("set-update-status");
+  if (manual) status.textContent = "正在检查…";
+  try {
+    const u = await invoke("check_update");
+    updateInfo = u;
+    $("set-version").textContent = u.current;
+    if (u.available) {
+      status.textContent = `发现新版本 ${u.latest}`;
+      const skipped = localStorage.getItem("skipUpdate") === u.latest;
+      if (manual || !skipped) showUpdateBar(u);
+    } else {
+      status.textContent = "已是最新版本";
+      if (manual) toast(`已是最新版本 ${u.current}`);
+    }
+  } catch (e) {
+    status.textContent = "检查失败,稍后会自动重试";
+    if (manual) toast(`${e}`, "err");
+  }
+}
+
+function showUpdateBar(u) {
+  $("update-title").textContent = `跨机中转 ${u.latest} 可以更新了(当前 ${u.current})`;
+  $("update-notes").textContent = u.notes || "";
+  $("update-bar").classList.remove("hidden");
+}
+
+$("update-go").onclick = () => {
+  if (!updateInfo) return;
+  invoke("open_update_url", { url: updateInfo.url || updateInfo.page })
+    .then(() => toast(IS_ANDROID ? "已在浏览器中下载,完成后点开安装包即可覆盖安装" : "已打开下载页"))
+    .catch((e) => toast(`打开下载失败: ${e}`, "err"));
+  $("update-bar").classList.add("hidden");
+};
+$("update-later").onclick = () => {
+  if (updateInfo) localStorage.setItem("skipUpdate", updateInfo.latest);
+  $("update-bar").classList.add("hidden");
+};
+$("set-check-update").onclick = () => checkUpdate(true);
+window.__TAURI__.app.getVersion().then((v) => ($("set-version").textContent = v)).catch(() => {});
+setTimeout(() => checkUpdate(false), 5000);
+setInterval(() => checkUpdate(false), UPDATE_EVERY);
 
 // ---------- 事件 ----------
 
