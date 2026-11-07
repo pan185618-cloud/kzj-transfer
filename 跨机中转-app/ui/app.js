@@ -4,7 +4,7 @@ const { listen } = window.__TAURI__.event;
 const { open, save } = window.__TAURI__.dialog;
 const { getCurrentWindow, LogicalSize, PhysicalPosition, currentMonitor } = window.__TAURI__.window;
 
-// Android WebView: no window management, no file-path drag/drop, no Finder-style
+// Android WebView: no window management, no desktop file-path drag/drop, no Finder-style
 // clipboard paths. Detect it once and hide the controls that cannot work there.
 const IS_ANDROID = /android/i.test(navigator.userAgent);
 if (IS_ANDROID) document.body.classList.add("android");
@@ -154,6 +154,8 @@ function renderDevices() {
   renderDevList();
   renderSubDevice();
   renderMessages();
+  window.renderScreenshotTarget?.();
+  window.refreshAndroidQuickSend?.();
 }
 
 // 「按设备」视图切换查看的设备
@@ -1170,19 +1172,24 @@ $("btn-paste").onclick = () => pasteFromButton().catch((e) => toast(`${e}`, "err
 async function sendPaths(paths, picked = null) {
   if ((!paths || !paths.length) && (!picked || !picked.length)) return;
   if (!ensureTarget()) {
-    pendingPaths = { paths, picked };
+    pendingPaths = {
+      paths: [...(pendingPaths?.paths || []), ...(paths || [])],
+      picked: [...(pendingPaths?.picked || []), ...(picked || [])],
+    };
     const n = (picked && picked.length) || (paths || []).length;
     toast(`已选 ${n} 项,勾选设备后自动发送`);
-    return;
+    return false;
   }
   const batch = newBatch();
-  await Promise.allSettled(
+  const results = await Promise.allSettled(
     targetDevices().map((d) =>
-      invoke("send_files", { fingerprint: d.fingerprint, paths: paths || [], picked, batch }).catch((err) =>
-        logLine("error", `发给 ${d.alias} 失败: ${err}`)
-      )
+      invoke("send_files", { fingerprint: d.fingerprint, paths: paths || [], picked, batch }).catch((err) => {
+        logLine("error", `发给 ${d.alias} 失败: ${err}`);
+        throw err;
+      })
     )
   );
+  return results.some((r) => r.status === "fulfilled");
 }
 
 // 文件夹按钮 → 菜单:选择文件 / 选择文件夹

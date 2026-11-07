@@ -84,6 +84,17 @@
 
   <!-- 底部:输入框 -->
   <footer id="composer">
+    <div id="screenshot-suggestion" class="quick-screenshot android-only hidden" role="region" aria-label="最近截图">
+      <img id="screenshot-preview" alt="最近截图预览">
+      <span class="quick-screenshot-info"><b>刚刚的截图</b><small id="screenshot-target">点发送即可传输</small></span>
+      <button id="screenshot-send" class="primary-btn" type="button">发送</button>
+      <button id="screenshot-dismiss" class="icon-btn" type="button" aria-label="忽略这张截图">×</button>
+    </div>
+    <div id="screenshot-onboarding" class="quick-onboarding android-only hidden">
+      <span>截完图，回到这里一键发送</span>
+      <button id="screenshot-enable" class="ghost-btn" type="button">开启</button>
+      <button id="screenshot-onboarding-dismiss" class="icon-btn" type="button" aria-label="关闭截图提醒介绍">×</button>
+    </div>
     <div id="target" class="target hidden">
       <span class="dot"></span><span>发给</span><b id="target-name"></b>
       <button id="target-change" class="link-btn">选择</button>
@@ -108,6 +119,10 @@
 
   <!-- 附件菜单 -->
   <div id="attach-menu" class="menu hidden">
+    <button id="pick-screenshot" class="menu-item android-only">
+      <span class="mi-icon c-blue">▧</span>
+      <span class="mi-text"><b>最近截图</b><small>提示刚截好的图片，一键发送</small></span>
+    </button>
     <button id="pick-files" class="menu-item">
       <span class="mi-icon c-blue"><svg viewBox="0 0 24 24"><path d="M7 3.5h6.5L18 8v12.5H7z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M13.5 3.5V8H18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></span>
       <span class="mi-text"><b>选择文件</b><small>照片、视频、文档,可多选</small></span>
@@ -185,6 +200,11 @@
       <span>聊天记录<small>重启后保留,已收到的文件不受影响</small></span>
       <button id="set-clear" class="ghost-btn danger-btn" type="button">清空</button>
     </div>
+    <div class="set-row android-only">
+      <span>截图快捷发送<small id="set-screenshot-status">开启后，回到 App 提示最近三分钟的截图</small></span>
+      <button id="set-screenshot-permission" class="ghost-btn hidden" type="button">照片授权</button>
+      <button id="set-screenshot" class="ghost-btn" type="button">开启</button>
+    </div>
     <div class="set-row">
       <span><div>版本 <b id="set-version">-</b></div><small id="set-update-status">启动时和每 6 小时自动检查</small></span>
       <button id="set-check-update" class="ghost-btn" type="button">检查更新</button>
@@ -197,5 +217,6 @@
   </dialog>
 
   <script src="app.js"></script>
+  <script src="quick-send.js"></script>
 </body>
 </html>

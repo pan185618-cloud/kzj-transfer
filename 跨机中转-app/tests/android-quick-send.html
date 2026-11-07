@@ -1,0 +1,141 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>安卓截图快捷发送回归</title>
+<style>body{font:14px system-ui}iframe{width:390px;height:780px;border:1px solid #ccc}pre{white-space:pre-wrap}</style>
+<p>从仓库根目录运行 python3 -m http.server 后打开本页。仅模拟安卓桥接，不连接真实设备。</p>
+<pre id="results">运行中…</pre><iframe></iframe>
+<script type="module">
+const frame = document.querySelector("iframe"), results = [];
+window.testResults = { done: false, results };
+const assert = (value, text) => { if (!value) throw new Error(text); };
+const test = async (name, run) => {
+  try { await run(); results.push({name,pass:true}); }
+  catch (error) { results.push({name,pass:false,error:error.message}); }
+  document.querySelector("pre").textContent = JSON.stringify(results,null,2);
+};
+function mock() {
+  Object.defineProperty(navigator,"userAgent",{value:"Android test WebView"});
+  localStorage.removeItem("screenshotIntroDismissed");
+  localStorage.removeItem("excludedTargets");
+  const events = new Map();
+  const device = {fingerprint:"test-mac",alias:"测试电脑",deviceType:"desktop"};
+  const m = window.mock = {
+    device, commands:[], native:{enabled:false,access:"none",imports:[],screenshot:null},
+    permission:"full", sendError:false, sendGate:null, ackFailures:0,
+    emit:(name,payload)=>events.get(name)?.({payload}),
+  };
+  window.__TAURI__ = {
+    core:{invoke:async(command,args)=>{
+      m.commands.push({command,args});
+      if(command==="list_devices")return[device];
+      if(command==="load_history")return"[]";
+      if(command==="read_image_preview")return"data:image/svg+xml,"+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="150"><rect width="100" height="150" fill="cornflowerblue"/></svg>');
+      if(command==="android_quick_send_state")return structuredClone(m.native);
+      if(command==="set_screenshot_suggestions") {
+        m.native.enabled=args.enabled && m.permission!=="none";
+        m.native.access=m.permission;
+        return structuredClone(m.native);
+      }
+      if(command==="acknowledge_quick_send") {
+        if(m.ackFailures-->0)throw new Error("模拟 ACK 失败");
+        if(args.id)m.native.imports=m.native.imports.filter(x=>x.id!==args.id);
+        if(args.uri===m.native.screenshot?.uri)m.native.screenshot=null;
+      }
+      if(command==="send_files") {
+        if(m.sendGate)await m.sendGate;
+        if(m.sendError)throw new Error("模拟启动传输失败");
+      }
+      if(command==="check_update")return{current:"test",available:false};
+      return null;
+    }},
+    event:{listen:async(name,callback)=>{events.set(name,callback);return()=>events.delete(name);}},
+    dialog:{},window:{},app:{getVersion:async()=>"test"},
+  };
+}
+let html=await(await fetch("../ui/index.html")).text();
+html=html.replace("<head>",`<head><base href="${new URL("../ui/",location.href).href}"><script>(${mock.toString()})();<\/script>`);
+const loaded=new Promise(resolve=>frame.onload=resolve);
+frame.srcdoc=html;await loaded;
+const w=frame.contentWindow,d=w.document,m=w.mock,$=id=>d.getElementById(id);
+const tick=()=>new Promise(resolve=>w.requestAnimationFrame(()=>w.requestAnimationFrame(resolve)));
+const refresh=async()=>{await w.refreshAndroidQuickSend();await tick();};
+const sends=()=>m.commands.filter(c=>c.command==="send_files");
+let sequence=0;
+const shot=()=>({uri:`content://media/external/images/media/${++sequence}`,name:`Screenshot_${sequence}.png`,size:1234,mimeType:"image/png",expiresAt:Date.now()+180000});
+const imported=(items=[shot()])=>({id:`import-${++sequence}`,source:"drop",items,error:""});
+await tick();
+
+await test("首次显示开启入口，不擅自申请照片权限",async()=>{
+  assert(!$("screenshot-onboarding").classList.contains("hidden"),"没有开启入口");
+  assert(!m.commands.some(c=>c.command==="set_screenshot_suggestions"),"启动时擅自申请权限");
+});
+await test("开启后提示截图与接收设备，识别本身不会发送",async()=>{
+  m.native.screenshot=shot();$("screenshot-enable").click();await tick();
+  assert(!$("screenshot-suggestion").classList.contains("hidden"),"未展示截图");
+  assert($("screenshot-target").textContent.includes("测试电脑"),"未展示接收目标");
+  assert(sends().length===0,"识别后擅自发送");
+});
+await test("点击截图发送，快速连点只启动一次传输",async()=>{
+  const item=m.native.screenshot;let release;m.sendGate=new Promise(r=>release=r);
+  $("screenshot-send").click();$("screenshot-send").click();await tick();
+  assert(sends().length===1,"重复发送");
+  assert(sends()[0].args.picked[0].uri===item.uri,"发送的不是提示截图");
+  release();m.sendGate=null;await tick();
+  assert($("screenshot-suggestion").classList.contains("hidden"),"发送后未收起");
+});
+await test("忽略截图后刷新不再提示",async()=>{
+  m.native.screenshot=shot();await refresh();$("screenshot-dismiss").click();await tick();await refresh();
+  assert($("screenshot-suggestion").classList.contains("hidden"),"忽略后又出现");
+});
+await test("过期截图不提示",async()=>{
+  m.native.screenshot={...shot(),expiresAt:Date.now()-1000};await refresh();
+  assert($("screenshot-suggestion").classList.contains("hidden"),"过期截图仍提示");
+});
+await test("没有接收设备时保留拖入队列，发现设备后只发一次",async()=>{
+  m.emit("devices-changed",[]);await tick();
+  const entry=imported();m.native.imports=[entry];const before=sends().length;await refresh();
+  assert(sends().length===before,"没有设备仍尝试发送");
+  assert(m.native.imports.length===1,"待发送图片丢失");
+  m.emit("devices-changed",[m.device]);await tick();await refresh();
+  assert(sends().length===before+1,"恢复设备后没有发送或重复发送");
+  assert(m.native.imports.length===0,"未确认消费队列");
+});
+await test("多张系统分享按同一批次发送，不丢图",async()=>{
+  const items=[shot(),shot()];m.native.imports=[{...imported(items),source:"share"}];const before=sends().length;
+  await refresh();
+  assert(sends().length===before+1,"没有按同一批发送");
+  assert(sends().at(-1).args.picked.length===2,"丢失分享图片");
+});
+await test("原生确认失败后重试 ACK，不重复发送图片",async()=>{
+  const entry=imported();m.native.imports=[entry];m.ackFailures=1;const before=sends().length;
+  await refresh();assert(m.native.imports.length===1,"没有保留未确认队列");
+  await refresh();assert(m.native.imports.length===0,"没有重试确认");
+  assert(sends().length===before+1,"ACK 失败导致重复发送");
+});
+await test("启动发送失败保留截图，可点击重试",async()=>{
+  m.native.screenshot=shot();await refresh();m.sendError=true;const before=sends().length;
+  $("screenshot-send").click();await tick();
+  assert(!$("screenshot-suggestion").classList.contains("hidden"),"失败后丢失截图");
+  assert(!$("screenshot-send").disabled,"失败后无法重试");
+  m.sendError=false;$("screenshot-send").click();await tick();
+  assert(sends().length===before+2,"未能重试");
+});
+await test("部分照片授权显示限制，同时仍能接住分享图片",async()=>{
+  m.permission="limited";$("set-screenshot-permission").classList.remove("hidden");$("set-screenshot-permission").click();await tick();
+  assert($("set-screenshot-status").textContent.includes("所选照片"),"未说明部分授权限制");
+  const before=sends().length;m.native.imports=[imported()];await refresh();
+  assert(sends().length===before+1,"部分授权阻断系统分享");
+});
+await test("关闭截图提醒后不显示截图，拖入仍可发送",async()=>{
+  $("set-screenshot").click();await tick();m.native.screenshot=shot();m.native.imports=[imported()];const before=sends().length;
+  await refresh();assert($("screenshot-suggestion").classList.contains("hidden"),"关闭后仍展示截图");
+  assert(sends().length===before+1,"关闭提醒阻断拖入");
+});
+await test("安卓原生拖入高亮开始与结束都能恢复",async()=>{
+  w.dispatchEvent(new w.CustomEvent("android-image-drag",{detail:true}));
+  assert($("stage").classList.contains("drag-over"),"没有拖入高亮");
+  w.dispatchEvent(new w.CustomEvent("android-image-drag",{detail:false}));
+  assert(!$("stage").classList.contains("drag-over"),"拖入结束高亮未清除");
+});
+window.testResults={done:true,results};
+</script>

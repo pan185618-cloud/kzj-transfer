@@ -2373,6 +2373,30 @@ pub async fn pick_folder(app: AppHandle) -> Result<serde_json::Value, String> {
     }
 }
 
+#[tauri::command]
+pub async fn android_quick_send_state(app: AppHandle) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    { android_command(&app, "quickSendState", serde_json::json!({})).await }
+    #[cfg(not(target_os = "android"))]
+    { let _ = app; Err("仅 Android 使用".into()) }
+}
+
+#[tauri::command]
+pub async fn set_screenshot_suggestions(app: AppHandle, enabled: bool) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    { android_command(&app, "setScreenshotSuggestions", serde_json::json!({ "enabled": enabled })).await }
+    #[cfg(not(target_os = "android"))]
+    { let _ = (app, enabled); Err("仅 Android 使用".into()) }
+}
+
+#[tauri::command]
+pub async fn acknowledge_quick_send(app: AppHandle, id: Option<String>, uri: Option<String>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    { android_command(&app, "acknowledgeQuickSend", serde_json::json!({ "id": id, "uri": uri })).await?; Ok(()) }
+    #[cfg(not(target_os = "android"))]
+    { let _ = (app, id, uri); Err("仅 Android 使用".into()) }
+}
+
 /// "a: b: c" — reqwest's top-level message ("error sending request") hides the
 /// actual cause (connection refused / TLS / timeout), so show the whole chain.
 fn error_chain(e: &dyn std::error::Error) -> String {

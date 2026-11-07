@@ -424,6 +424,20 @@ body.compact .update-bar { display: none !important; }
 }
 body.android #composer { padding-bottom: calc(12px + max(var(--safe-bottom), 16px)); }
 
+.quick-screenshot, .quick-onboarding {
+  display: flex; align-items: center; gap: 10px; margin: 0 0 8px;
+  padding: 8px; border: 1px solid var(--accent-ring); border-radius: 14px;
+  background: var(--accent-soft);
+}
+.quick-screenshot img { width: 48px; height: 58px; object-fit: cover; border-radius: 7px; background: var(--surface); flex-shrink: 0; }
+.quick-screenshot-info, .quick-onboarding > span { flex: 1; min-width: 0; }
+.quick-screenshot-info b { display: block; font-size: 13px; }
+.quick-screenshot-info small { display: block; font-size: 11px; color: var(--text-2); margin-top: 3px; overflow-wrap: anywhere; }
+.quick-screenshot .primary-btn { padding: 9px 13px; flex-shrink: 0; }
+.quick-screenshot .icon-btn, .quick-onboarding .icon-btn { width: 28px; height: 32px; font-size: 22px; flex-shrink: 0; }
+.quick-onboarding { font-size: 12px; gap: 6px; }
+.quick-onboarding .ghost-btn { padding: 5px 8px; }
+
 .target {
   display: flex; align-items: center; gap: 6px;
   font-size: 12px; color: var(--text-3);
