@@ -591,8 +591,36 @@ function metaText(m) {
   return view === "device" ? fmtTime(m.ts) : `${who} · ${fmtTime(m.ts)}`;
 }
 
+const messageKeys = new WeakMap();
+let nextMessageKey = 0;
+const messageNodes = new Map();
+const visibleMessageKeys = new Set();
+
+function messageKey(m) {
+  if (m.batch && view !== "device") return `batch:${m.batch}`;
+  if (!messageKeys.has(m)) messageKeys.set(m, `msg:${++nextMessageKey}`);
+  return messageKeys.get(m);
+}
+
+function cachedMsgNode(m) {
+  const key = messageKey(m);
+  visibleMessageKeys.add(key);
+  // 进度更新只改状态区,保留已加载的图片和已展开的文件夹。
+  const content = JSON.stringify([m.dir, m.kind, m.text, m.files, metaText(m)]);
+  let cached = messageNodes.get(key);
+  if (!cached || cached.content !== content) {
+    cached = { content, node: msgNode(m) };
+    cached.node.dataset.scrollKey = key;
+    messageNodes.set(key, cached);
+  } else {
+    renderTransfer(cached.node.querySelector(".m-transfer"), m);
+  }
+  return cached.node;
+}
+
 function msgNode(m) {
   const li = el("li", `msg ${m.dir}`);
+  if (m._old) li.style.animation = "none";
   li.appendChild(el("div", "m-meta", metaText(m)));
   const bubble = el("div", "bubble" + (m.kind === "text" ? " text" : " files"));
 
@@ -608,12 +636,21 @@ function msgNode(m) {
     for (const f of m.files) bubble.appendChild(bubbleForFile(f, m.dir));
   }
 
+  const transfer = el("div", "m-transfer");
+  renderTransfer(transfer, m);
+  bubble.appendChild(transfer);
+  li.appendChild(bubble);
+  return li;
+}
+
+function renderTransfer(transfer, m) {
+  transfer.replaceChildren();
   if (m.state && m.state !== "done") {
     const bar = el("div", "bar");
     const fill = el("div");
     fill.style.width = `${Math.min(100, Math.round((m.ratio || 0) * 100))}%`;
     bar.appendChild(fill);
-    bubble.appendChild(bar);
+    transfer.appendChild(bar);
     const row = el("div", "t-row");
     row.appendChild(el("span", "t-status" + (m.state === "failed" || m.state === "cancelled" ? " bad" : ""), m.statusText || ""));
     if (m.cancellable) {
@@ -621,13 +658,10 @@ function msgNode(m) {
       btn.onclick = m.onCancel || (() => {});
       row.appendChild(btn);
     }
-    bubble.appendChild(row);
+    transfer.appendChild(row);
   } else if (m.statusText && m.kind !== "text") {
-    bubble.appendChild(el("div", "t-row", "")).appendChild(el("span", "t-status", m.statusText));
+    transfer.appendChild(el("div", "t-row", "")).appendChild(el("span", "t-status", m.statusText));
   }
-
-  li.appendChild(bubble);
-  return li;
 }
 
 function allMsgs(filterFp = null) {
@@ -677,9 +711,19 @@ function mergeBatch(parts) {
   };
 }
 
-function dayDivider(ts) {
-  const li = el("li", "day-divider");
-  li.appendChild(el("span", null, dayLabel(ts)));
+const dayNodes = new Map();
+const visibleDayKeys = new Set();
+
+function dayDivider(ts, count = null) {
+  const key = dayKey(ts);
+  visibleDayKeys.add(key);
+  let li = dayNodes.get(key);
+  if (!li) {
+    li = el("li", "day-divider");
+    li.appendChild(el("span"));
+    dayNodes.set(key, li);
+  }
+  li.firstChild.textContent = dayLabel(ts) + (count === null ? "" : ` · ${count} 条`);
   return li;
 }
 
@@ -692,7 +736,7 @@ function renderChat(ul, msgs) {
       ul.appendChild(dayDivider(m.ts));
       last = k;
     }
-    ul.appendChild(msgNode(m));
+    ul.appendChild(cachedMsgNode(m));
   }
 }
 
@@ -707,6 +751,7 @@ function renderImages(ul, msgs) {
   for (const { m, f } of items.reverse()) {
     const path = f.savedPath || f.saved_path;
     const cell = el("button", "g-cell");
+    cell.dataset.scrollKey = `${messageKey(m)}:file:${m.files.indexOf(f)}`;
     cell.title = `${f.name} · ${m.alias} · ${fmtTime(m.ts)}`;
     const img = el("img");
     img.alt = f.name;
@@ -734,6 +779,7 @@ function renderFiles(ul, msgs) {
   const li = el("li", "list-card");
   for (const { m, f } of rows.reverse()) {
     const row = bubbleForFile(f, m.dir, true);
+    row.dataset.scrollKey = `${messageKey(m)}:file:${m.files.indexOf(f)}`;
     row.classList.add("list-row");
     row.querySelector(".f-sub").textContent =
       `${fmtBytes(f.size || 0)} · ${m.dir === "in" ? "来自 " : "发给 "}${m.alias} · ${dayLabel(m.ts)} ${fmtTime(m.ts)}`;
@@ -747,12 +793,13 @@ function renderLinks(ul, msgs) {
   const rows = [];
   for (const m of msgs) {
     if (m.kind !== "text") continue;
-    for (const u of m.text.match(URL_RE) || []) rows.push({ m, u });
+    for (const [index, u] of (m.text.match(URL_RE) || []).entries()) rows.push({ m, u, index });
   }
   if (!rows.length) return 0;
   const li = el("li", "list-card");
-  for (const { m, u } of rows.reverse()) {
+  for (const { m, u, index } of rows.reverse()) {
     const row = el("div", "f-card list-row openable");
+    row.dataset.scrollKey = `${messageKey(m)}:link:${index}`;
     const badge = el("span", "f-badge c-blue link");
     badge.innerHTML = '<svg viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
     const info = el("div", "f-info");
@@ -772,24 +819,77 @@ function renderLinks(ul, msgs) {
 
 const TYPE_EMPTY = { image: "还没有收发过图片", file: "还没有收发过文件", link: "还没有收发过链接", date: "还没有内容" };
 
+let renderedView = null;
+let messageViewport = null;
+const newestAtTop = () => view === "type";
+const currentMessageView = () => `${view}:${view === "device" ? selectedFingerprint : view === "type" ? typeFilter : ""}`;
+
+function captureMessageViewport() {
+  const stage = $("stage");
+  const top = stage.getBoundingClientRect().top;
+  const anchor = [...$("msg-list").querySelectorAll("[data-scroll-key]")]
+    .find((n) => n.getBoundingClientRect().bottom > top);
+  return {
+    scrollTop: stage.scrollTop,
+    follow: newestAtTop() ? stage.scrollTop <= 32 : stage.scrollHeight - stage.clientHeight - stage.scrollTop <= 32,
+    key: anchor?.dataset.scrollKey,
+    offset: anchor ? anchor.getBoundingClientRect().top - top : 0,
+  };
+}
+
+function restoreMessageViewport(position) {
+  const stage = $("stage");
+  if (position.follow) {
+    stage.scrollTop = newestAtTop() ? 0 : stage.scrollHeight;
+  } else {
+    const anchor = [...$("msg-list").querySelectorAll("[data-scroll-key]")]
+      .find((n) => n.dataset.scrollKey === position.key);
+    stage.scrollTop = anchor
+      ? stage.scrollTop + anchor.getBoundingClientRect().top - stage.getBoundingClientRect().top - position.offset
+      : position.scrollTop;
+  }
+  messageViewport = captureMessageViewport();
+}
+
+$("stage").addEventListener("scroll", () => {
+  messageViewport = captureMessageViewport();
+});
+// 缩略图异步加载后高度仍可能变化:继续跟随最新内容,或保持正在阅读的消息位置。
+const messageResizeObserver = new ResizeObserver(() => {
+  const stage = $("stage");
+  if (!messageViewport || !stage.clientHeight) return;
+  // 滚动事件可能尚未派发;先尊重布局回调之前用户刚刚发生的滚动。
+  if (Math.abs(stage.scrollTop - messageViewport.scrollTop) > 1) {
+    messageViewport = captureMessageViewport();
+  } else {
+    restoreMessageViewport(messageViewport);
+  }
+});
+messageResizeObserver.observe($("msg-list"));
+
 function renderMessages() {
   scheduleSave();
+  const viewKey = currentMessageView();
+  const position = renderedView === viewKey ? captureMessageViewport() : { follow: true };
   const ul = $("msg-list");
-  ul.innerHTML = "";
+  const nodes = [];
+  const output = { appendChild: (node) => nodes.push(node) };
+  visibleMessageKeys.clear();
+  visibleDayKeys.clear();
   let count = 0;
   if (view === "all") {
     const msgs = allMsgs();
-    renderChat(ul, msgs);
+    renderChat(output, msgs);
     count = msgs.length;
   } else if (view === "device") {
     const msgs = selectedFingerprint ? allMsgs(selectedFingerprint) : [];
-    renderChat(ul, msgs);
+    renderChat(output, msgs);
     count = msgs.length;
   } else {
     const msgs = allMsgs();
-    if (typeFilter === "image") count = renderImages(ul, msgs);
-    else if (typeFilter === "file") count = renderFiles(ul, msgs);
-    else if (typeFilter === "link") count = renderLinks(ul, msgs);
+    if (typeFilter === "image") count = renderImages(output, msgs);
+    else if (typeFilter === "file") count = renderFiles(output, msgs);
+    else if (typeFilter === "link") count = renderLinks(output, msgs);
     else {
       // 日期:按天倒序分组的时间线
       const byDay = new Map();
@@ -800,13 +900,30 @@ function renderMessages() {
       }
       for (const k of [...byDay.keys()].sort().reverse()) {
         const ms = byDay.get(k);
-        const head = dayDivider(ms[0].ts);
-        head.firstChild.textContent += ` · ${ms.length} 条`;
-        ul.appendChild(head);
-        for (const m of ms) ul.appendChild(msgNode(m));
+        const head = dayDivider(ms[0].ts, ms.length);
+        output.appendChild(head);
+        for (const m of ms) output.appendChild(cachedMsgNode(m));
       }
       count = msgs.length;
     }
+  }
+
+  // 原位插入/删除,不先清空列表,避免滚动被钳制到开头和历史图片重新加载。
+  let cursor = ul.firstChild;
+  for (const node of nodes) {
+    if (node === cursor) cursor = cursor.nextSibling;
+    else ul.insertBefore(node, cursor);
+  }
+  while (cursor) {
+    const next = cursor.nextSibling;
+    cursor.remove();
+    cursor = next;
+  }
+  for (const key of messageNodes.keys()) {
+    if (!visibleMessageKeys.has(key)) messageNodes.delete(key);
+  }
+  for (const key of dayNodes.keys()) {
+    if (!visibleDayKeys.has(key)) dayNodes.delete(key);
   }
 
   const noDevices = devices.length === 0 && !hasMessages();
@@ -819,9 +936,8 @@ function renderMessages() {
       : IS_ANDROID ? "输入文字或链接点「发送」,点左下角文件夹图标发送文件或整个文件夹"
       : "输入文字或链接按 Enter 发送;点左下角文件夹图标发文件/文件夹,也可以直接把文件拖进窗口或 ⌘V 粘贴";
   }
-  // 时间线类视图滚到底部,列表类视图停在顶部(最新在上)
-  const stage = $("stage");
-  stage.scrollTop = view === "type" && typeFilter !== "date" ? 0 : stage.scrollHeight;
+  renderedView = viewKey;
+  restoreMessageViewport(position);
 }
 
 function hasMessages() {

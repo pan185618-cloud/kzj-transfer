@@ -1,0 +1,163 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>消息滚动回归</title>
+<style>body { font: 14px system-ui; } iframe { width: 960px; height: 680px; border: 1px solid #ccc; } pre { white-space: pre-wrap; }</style>
+<p>从仓库根目录运行 python3 -m http.server，然后打开本页。使用模拟事件和独立历史记录，不连接传输后端。</p>
+<pre id="results">运行中…</pre>
+<iframe></iframe>
+<script type="module">
+const frame = document.querySelector("iframe");
+const results = [];
+window.testResults = { done: false, results };
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+const test = async (name, run) => {
+  try { await run(); results.push({ name, pass: true }); }
+  catch (error) { results.push({ name, pass: false, error: error.message }); }
+  document.querySelector("pre").textContent = JSON.stringify(results, null, 2);
+};
+const mock = () => {
+  const events = new Map();
+  const previews = [];
+  const device = { fingerprint: "test-phone", alias: "测试手机", deviceType: "mobile" };
+  const ts = Date.now() - 3 * 86400000;
+  const msgs = Array.from({ length: 80 }, (_, i) => ({
+    dir: "in", kind: "text", alias: device.alias, state: "done",
+    text: `历史记录 ${i}：用于检查接收新内容时正在阅读的位置是否保持。`,
+    ts: ts + Math.floor(i / 20) * 86400000 + i * 1000,
+  }));
+  msgs[20] = { ...msgs[20], kind: "files", files: [{ name: "旧图.png", fileType: "image/png", savedPath: "/test/old.png", size: 100 }] };
+  msgs[30] = { ...msgs[30], kind: "files", files: Array.from({ length: 9 }, (_, i) => ({ name: `资料/${i}.txt`, fileType: "text/plain", savedPath: `/test/${i}.txt`, size: 100 })) };
+  window.mock = {
+    device, previewCalls: 0,
+    emit: (name, payload) => events.get(name)?.({ payload }),
+    flushPreviews: () => previews.splice(0).forEach((resolve) => resolve("data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="280" height="220"><rect width="280" height="220" fill="cornflowerblue"/></svg>'))),
+  };
+  window.__TAURI__ = {
+    core: { invoke: async (command) => {
+      if (command === "list_devices") return [device];
+      if (command === "load_history") return JSON.stringify([{ fp: device.fingerprint, msgs }]);
+      if (command === "read_image_preview") {
+        window.mock.previewCalls++;
+        return new Promise((resolve) => previews.push(resolve));
+      }
+      if (command === "check_update") return { current: "test", available: false };
+      return null;
+    } },
+    event: { listen: async (name, callback) => { events.set(name, callback); return () => events.delete(name); } },
+    dialog: {}, window: {}, app: { getVersion: async () => "test" },
+  };
+};
+let html = await (await fetch("../ui/index.html")).text();
+const base = new URL("../ui/", location.href).href;
+html = html.replace("<head>", `<head><base href="${base}"><script>(${mock.toString()})();<\/script>`);
+const loaded = new Promise((resolve) => frame.onload = resolve);
+frame.srcdoc = html;
+await loaded;
+const w = frame.contentWindow;
+const d = w.document;
+const stage = d.getElementById("stage");
+const tick = async () => {
+  await new Promise((resolve) => w.requestAnimationFrame(() => w.requestAnimationFrame(resolve)));
+};
+const settleAnimations = () => Promise.all(d.getAnimations().map((a) => a.finished.catch(() => {})));
+const bottomGap = () => stage.scrollHeight - stage.clientHeight - stage.scrollTop;
+const emit = (name, payload) => w.mock.emit(name, { ...w.mock.device, ...payload });
+const progress = (doneBytes) => emit("receive-progress", { sessionId: "new", totalBytes: 100, doneBytes, totalFiles: 1, finishedFiles: 0, speedBps: 1 });
+const receive = (text) => emit("message-received", { text, tsMs: Date.now() });
+const anchor = () => [...d.querySelectorAll(".msg")].find((n) => n.getBoundingClientRect().bottom > stage.getBoundingClientRect().top + 10);
+await tick();
+
+await test("初次加载停在最新消息", async () => {
+  assert(bottomGap() < 2, `距底部 ${bottomGap()}`);
+});
+await test("历史图片异步加载保持正在阅读的消息位置", async () => {
+  await settleAnimations();
+  stage.scrollTop = 3200;
+  await tick();
+  const node = anchor(), y = node.getBoundingClientRect().top;
+  w.mock.flushPreviews();
+  await tick();
+  await Promise.all([...d.images].map((img) => img.decode().catch(() => {})));
+  await tick();
+  assert(Math.abs(node.getBoundingClientRect().top - y) < 2, `图片加载导致阅读位置改变: ${y} -> ${node.getBoundingClientRect().top}`);
+  stage.scrollTop = stage.scrollHeight;
+  await tick();
+});
+await test("接收新消息保留历史图片节点,不重复请求缩略图", async () => {
+  const img = d.querySelector(".f-thumb");
+  const calls = w.mock.previewCalls;
+  receive("新收到的文字");
+  await tick();
+  assert(d.querySelector(".f-thumb") === img, "历史图片节点被重建");
+  assert(w.mock.previewCalls === calls, "重复加载历史缩略图");
+  assert(bottomGap() < 2, `距底部 ${bottomGap()}`);
+});
+await test("翻看历史时连续接收和进度刷新保持原位", async () => {
+  stage.scrollTop = 1300;
+  await tick();
+  const node = anchor(), y = node.getBoundingClientRect().top;
+  receive("阅读历史时的新消息");
+  for (let i = 0; i <= 100; i += 10) progress(i);
+  await tick();
+  assert(node.isConnected, "正在阅读的消息被替换");
+  assert(Math.abs(node.getBoundingClientRect().top - y) < 2, "阅读位置被改变");
+});
+await test("设备发现刷新保持阅读位置", async () => {
+  const node = anchor(), y = node.getBoundingClientRect().top;
+  w.mock.emit("devices-changed", [w.mock.device]);
+  await tick();
+  assert(Math.abs(node.getBoundingClientRect().top - y) < 2, "设备刷新触发跳转");
+});
+await test("传输进度保留已展开文件夹", async () => {
+  d.querySelector(".f-more").click();
+  progress(80);
+  await tick();
+  assert(!d.querySelector(".f-more"), "文件夹被重新折叠");
+  assert(d.querySelectorAll(".f-folder-items .f-card").length === 9, "展开内容丢失");
+});
+await test("接收图片完成后异步加载仍停在最新位置", async () => {
+  stage.scrollTop = stage.scrollHeight;
+  await tick();
+  emit("receive-done", { sessionId: "new", reason: "finished", receivedFiles: 1, failedFiles: 0,
+    files: [{ id: "new-image", name: "新图.png", fileType: "image/png", savedPath: "/test/new.png", size: 100 }] });
+  w.mock.flushPreviews();
+  await tick();
+  await Promise.all([...d.images].map((img) => img.decode().catch(() => {})));
+  await tick();
+  assert(bottomGap() < 2, `距底部 ${bottomGap()}`);
+});
+await test("日期分类初次显示最新日期", async () => {
+  w.setView("type");
+  d.querySelector('[data-type="date"]').click();
+  await tick();
+  assert(stage.scrollTop < 2, `跳到旧日期,scrollTop=${stage.scrollTop}`);
+  assert(d.querySelector(".day-divider").textContent.includes("今天"), "最新日期未排在前面");
+});
+await test("文件分类新增文件后保持正在查看的条目", async () => {
+  d.querySelector('[data-type="file"]').click();
+  // 用实际接收完成事件添加足够长的文件列表。
+  emit("receive-done", { sessionId: "files", reason: "finished", receivedFiles: 40, failedFiles: 0,
+    files: Array.from({ length: 40 }, (_, i) => ({ id: `f${i}`, name: `文件${i}.txt`, fileType: "text/plain", size: 100, savedPath: `/test/f${i}.txt` })) });
+  stage.scrollTop = 600;
+  await tick();
+  const keyNode = [...d.querySelectorAll(".list-row")].find((n) => n.getBoundingClientRect().bottom > stage.getBoundingClientRect().top + 10);
+  const name = keyNode.querySelector(".f-name").textContent, y = keyNode.getBoundingClientRect().top;
+  emit("receive-done", { sessionId: "another", reason: "finished", receivedFiles: 1, failedFiles: 0,
+    files: [{ id: "another", name: "刚收到.txt", fileType: "text/plain", size: 100, savedPath: "/test/another.txt" }] });
+  await tick();
+  const same = [...d.querySelectorAll(".list-row")].find((n) => n.querySelector(".f-name").textContent === name);
+  assert(Math.abs(same.getBoundingClientRect().top - y) < 2, `新增条目导致历史文件位置跳动: ${y} -> ${same.getBoundingClientRect().top}, scroll=${stage.scrollTop}`);
+});
+await test("按设备查看时其他设备新消息不改变当前会话", async () => {
+  w.setView("device");
+  await settleAnimations();
+  stage.scrollTop = 900;
+  await tick();
+  const node = anchor(), y = node.getBoundingClientRect().top;
+  emit("message-received", { fingerprint: "another-phone", alias: "另一台手机", text: "其他设备消息" });
+  await tick();
+  assert(!d.getElementById("msg-list").textContent.includes("其他设备消息"), "会话被切换");
+  assert(Math.abs(node.getBoundingClientRect().top - y) < 2, `当前会话位置被改变: ${y} -> ${node.getBoundingClientRect().top}, scroll=${stage.scrollTop}`);
+});
+window.testResults.done = true;
+</script>

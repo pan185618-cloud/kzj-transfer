@@ -214,7 +214,9 @@ body.android .toolbar { padding-top: calc(10px + max(var(--safe-top), 28px)); }
   overflow-y: auto;
   padding: 6px 16px 18px;
   display: flex; flex-direction: column;
-  scroll-behavior: smooth;
+  /* 接收/进度刷新时同步保持位置,避免滚动动画与图片加载反复拉扯。 */
+  scroll-behavior: auto;
+  overflow-anchor: none;
 }
 #stage.drag-over {
   outline: 2px dashed var(--accent);
