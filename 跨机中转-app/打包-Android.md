@@ -55,11 +55,17 @@ npx tauri android build --apk
 - `package.json`：加 `"tauri": "tauri"` script(Gradle 的 rustBuild 任务
   通过 `npm run -- tauri android android-studio-script` 调 CLI)。
 
+## 0.2.1 手机文件预览与更新
+
+- 已发送文件保留 SAF `content://` URI，并尽可能持久化读取授权；接收文件使用本机保存路径。
+- 图片由 Android 系统解码并采样为缩略图，支持系统可解码的 PNG、JPEG、HEIC 等格式；点文件卡片使用系统应用打开，并授予临时读取权限。
+- 旧版本发出的历史记录没有保存 URI，升级不能补回缺失的位置；这些记录需要重新选取发送才能预览。
+- 更新检查使用 Android 系统 HTTPS，依次尝试 Fastly、Gcore、jsDelivr 主域和 GitHub Raw。检查失败后可重试，详细原因留在日志和状态提示的 title 中。
+- 界面回归：从仓库根目录运行 `python3 -m http.server`，打开 `/跨机中转-app/tests/message-scroll.html`；使用独立模拟历史，不访问传输后端。
+
 ## 已知限制（手机上）
 
-- 文件选择走 SAF，系统返回 `content://` URI —— tauri-plugin-dialog
-  的 Android 实现会尽量转成真实路径；转不出的按字节流发送
-  （后端 `FileSource::Bytes` 已支持），但目录选取不可用。
+- 文件和目录选择均走自带 SAF 选择器；URI 授权被来源撤销或原文件删除后，需要重新选择。PDF、Office 等文件的打开取决于手机是否安装相应应用。
 - 接收目录默认应用私有 Downloads 目录；「打开接收目录」依赖系统
   文件管理器响应 `open` intent。
 - 无窗口装饰/置顶 API，灵动岛小窗模式已隐藏。

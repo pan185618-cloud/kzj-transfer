@@ -28,19 +28,24 @@ const mock = () => {
   msgs[20] = { ...msgs[20], kind: "files", files: [{ name: "旧图.png", fileType: "image/png", savedPath: "/test/old.png", size: 100 }] };
   msgs[30] = { ...msgs[30], kind: "files", files: Array.from({ length: 9 }, (_, i) => ({ name: `资料/${i}.txt`, fileType: "text/plain", savedPath: `/test/${i}.txt`, size: 100 })) };
   window.mock = {
-    device, previewCalls: 0,
+    device, previewCalls: 0, commands: [], updateError: null, updateGate: null,
     emit: (name, payload) => events.get(name)?.({ payload }),
     flushPreviews: () => previews.splice(0).forEach((resolve) => resolve("data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="280" height="220"><rect width="280" height="220" fill="cornflowerblue"/></svg>'))),
   };
   window.__TAURI__ = {
-    core: { invoke: async (command) => {
+    core: { invoke: async (command, args) => {
+      window.mock.commands.push({ command, args });
       if (command === "list_devices") return [device];
       if (command === "load_history") return JSON.stringify([{ fp: device.fingerprint, msgs }]);
       if (command === "read_image_preview") {
         window.mock.previewCalls++;
         return new Promise((resolve) => previews.push(resolve));
       }
-      if (command === "check_update") return { current: "test", available: false };
+      if (command === "check_update") {
+        if (window.mock.updateGate) await window.mock.updateGate;
+        if (window.mock.updateError) throw window.mock.updateError;
+        return { current: "test", available: false };
+      }
       return null;
     } },
     event: { listen: async (name, callback) => { events.set(name, callback); return () => events.delete(name); } },
@@ -158,6 +163,43 @@ await test("按设备查看时其他设备新消息不改变当前会话", async
   await tick();
   assert(!d.getElementById("msg-list").textContent.includes("其他设备消息"), "会话被切换");
   assert(Math.abs(node.getBoundingClientRect().top - y) < 2, `当前会话位置被改变: ${y} -> ${node.getBoundingClientRect().top}, scroll=${stage.scrollTop}`);
+});
+await test("SAF 图片 URI 和缺失 MIME 的图片均可生成预览并传给系统打开", async () => {
+  w.setView("all");
+  emit("send-progress", { sendId: "uri-image", state: "done", kind: "files", totalBytes: 100, doneBytes: 100,
+    files: [{ id: "uri-image", name: "手机照片.heic", fileType: "application/octet-stream", savedPath: "content://test/images/12", size: 100 }] });
+  w.mock.flushPreviews();
+  await tick();
+  const img = [...d.querySelectorAll(".f-thumb")].find((n) => n.alt === "手机照片.heic");
+  assert(img, "SAF URI 图片没有创建缩略图");
+  await img.decode();
+  assert(img.naturalWidth > 0, "缩略图没有解码");
+  img.closest(".f-card").click();
+  const call = w.mock.commands.filter((c) => c.command === "open_file").pop();
+  assert(call.args.path === "content://test/images/12" && call.args.mimeType === "image/heic", "打开文件时 URI 或 MIME 丢失");
+});
+await test("检查更新阻止重复请求并在完成后恢复按钮", async () => {
+  let finish;
+  w.mock.updateGate = new Promise((resolve) => finish = resolve);
+  const calls = w.mock.commands.filter((c) => c.command === "check_update").length;
+  const pending = w.checkUpdate(true);
+  await w.checkUpdate(true);
+  assert(d.getElementById("set-check-update").disabled, "检查期间按钮没有禁用");
+  assert(w.mock.commands.filter((c) => c.command === "check_update").length === calls + 1, "同时发起了重复请求");
+  finish();
+  await pending;
+  w.mock.updateGate = null;
+  assert(!d.getElementById("set-check-update").disabled, "完成后按钮没有恢复");
+  assert(d.getElementById("set-update-status").textContent === "已是最新版本", "成功结果没有显示");
+});
+await test("检查失败可再次重试,不会停在正在检查", async () => {
+  w.mock.updateError = "Connection reset";
+  await w.checkUpdate(true);
+  assert(d.getElementById("set-update-status").textContent.includes("暂时无法连接"), "没有给出失败提示");
+  assert(!d.getElementById("set-check-update").disabled, "失败后按钮没有恢复");
+  w.mock.updateError = null;
+  await w.checkUpdate(true);
+  assert(d.getElementById("set-update-status").textContent === "已是最新版本", "失败后无法重试");
 });
 window.testResults.done = true;
 </script>

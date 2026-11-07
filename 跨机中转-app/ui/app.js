@@ -335,7 +335,13 @@ function linkify(text) {
   return frag;
 }
 
-const mimeOf = (f) => (f.fileType || f.file_type || "").toLowerCase();
+const IMAGE_MIMES = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml", heic: "image/heic", heif: "image/heif", avif: "image/avif" };
+const mimeOf = (f) => {
+  const mime = (f.fileType || f.file_type || "").toLowerCase();
+  return !mime || mime === "application/octet-stream"
+    ? IMAGE_MIMES[(f.name || "").split(".").pop().toLowerCase()] || mime
+    : mime;
+};
 const isImage = (f) => mimeOf(f).startsWith("image/");
 
 // 文件类型 → [标签, 颜色]
@@ -439,6 +445,7 @@ function bubbleForFolder(g, dir) {
 }
 
 function loadThumb(img, path, onFail) {
+  img.onerror = onFail;
   invoke("read_image_preview", { path })
     .then((url) => (img.src = url))
     .catch(onFail);
@@ -574,7 +581,7 @@ function bubbleForFile(f, dir, compact = false) {
     card.classList.add("openable");
     card.title = path;
     card.onclick = () =>
-      invoke("open_file", { path }).catch((e) => logLine("error", `打开失败: ${e}`));
+      invoke("open_file", { path, mimeType: mimeOf(f) }).catch((e) => logLine("error", `打开失败: ${e}`));
     makeDraggable(card, fileDragPayload(f, path, thumbEl));
     if (!IS_ANDROID && !compact) {
       const saveBtn = el("button", "f-save-as", "另存为");
@@ -761,7 +768,7 @@ function renderImages(ul, msgs) {
     });
     cell.appendChild(img);
     cell.appendChild(el("span", `g-dir ${m.dir}`, m.dir === "in" ? "收" : "发"));
-    cell.onclick = () => invoke("open_file", { path }).catch((e) => logLine("error", `打开失败: ${e}`));
+    cell.onclick = () => invoke("open_file", { path, mimeType: mimeOf(f) }).catch((e) => logLine("error", `打开失败: ${e}`));
     makeDraggable(cell, fileDragPayload(f, path, img));
     li.appendChild(cell);
   }
@@ -1360,11 +1367,17 @@ $("set-browse").onclick = async () => {
 // 但设置里仍显示有新版本。
 
 let updateInfo = null;
+let checkingUpdate = false;
 const UPDATE_EVERY = 6 * 3600 * 1000;
 
 async function checkUpdate(manual = false) {
+  if (checkingUpdate) return;
+  checkingUpdate = true;
   const status = $("set-update-status");
-  if (manual) status.textContent = "正在检查…";
+  const button = $("set-check-update");
+  status.textContent = "正在检查…";
+  status.title = "";
+  button.disabled = true;
   try {
     const u = await invoke("check_update");
     updateInfo = u;
@@ -1378,8 +1391,13 @@ async function checkUpdate(manual = false) {
       if (manual) toast(`已是最新版本 ${u.current}`);
     }
   } catch (e) {
-    status.textContent = "检查失败,稍后会自动重试";
-    if (manual) toast(`${e}`, "err");
+    console.warn("check_update", e);
+    status.textContent = "暂时无法连接更新服务,请稍后重试";
+    status.title = String(e);
+    if (manual) toast("暂时无法连接更新服务,请稍后重试", "err");
+  } finally {
+    checkingUpdate = false;
+    button.disabled = false;
   }
 }
 
