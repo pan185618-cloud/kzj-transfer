@@ -2033,10 +2033,66 @@ fn paste_file_paths_impl() -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows:Explorer 复制文件后剪贴板里是 CF_HDROP——一个 DROPFILES 结构
+/// 后跟双 NUL 结尾的宽字符路径列表。OpenClipboard 需要配合窗口的消息循环
+/// 重试;文件被拖动/占用时短暂拿不到,这里多试几次。
+#[cfg(target_os = "windows")]
 fn paste_file_paths_impl() -> Result<Vec<String>, String> {
-    // Windows/Linux: WebView2/gtk paste doesn't expose absolute file paths
-    // through DataTransfer either; add a native reader per-platform if needed.
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::Foundation::{HGLOBAL, HWND};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    };
+    use windows::Win32::System::Memory::GlobalSize;
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+    const CF_HDROP: u32 = 15;
+
+    unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP).is_err() {
+            return Ok(Vec::new());
+        }
+        let mut opened = false;
+        for _ in 0..5 {
+            if OpenClipboard(HWND::default()).is_ok() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !opened {
+            return Err("剪贴板被占用,请重试".to_string());
+        }
+        let result = (|| {
+            let handle = GetClipboardData(CF_HDROP).map_err(|e| e.to_string())?;
+            let hdrop = HDROP(handle.0 as _);
+            let count = DragQueryFileW(hdrop, u32::MAX, None);
+            let mut out = Vec::with_capacity(count as usize);
+            // GlobalSize 返回整个 DROPFILES+路径列表的字节数,宽字符缓冲按
+            // 一半预留足够上限(DragQueryFileW 只写实际路径长度)。
+            let cap = (GlobalSize(HGLOBAL(handle.0 as _)) / 2).max(260);
+            let mut buf = vec![0u16; cap];
+            for i in 0..count {
+                let len = DragQueryFileW(hdrop, i, Some(&mut buf));
+                if len == 0 {
+                    continue;
+                }
+                out.push(OsString::from_wide(&buf[..len as usize])
+                    .to_string_lossy()
+                    .into_owned());
+            }
+            Ok(out)
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn paste_file_paths_impl() -> Result<Vec<String>, String> {
+    // Linux: gtk paste doesn't expose absolute file paths through
+    // DataTransfer either; add a native reader if needed.
     Ok(Vec::new())
 }
 
