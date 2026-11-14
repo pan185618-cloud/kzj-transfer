@@ -277,6 +277,21 @@ fn reqwest_error_detail(err: &ClientError) -> String {
     if detail.contains("fingerprint mismatch") {
         detail.push_str("(对方设备指纹已变化,可能是重装或发现了同名的旧设备,请让对方重新在线)");
     }
+    // "500;Some(\"...\")" comes from StatusCodeError's "{status};{message:?}"
+    // display; when the receiver put a real reason into the body, show just
+    // that instead of the noise around it.
+    if let Some((status, message)) = detail.split_once(';') {
+        let message = message.trim();
+        if status.trim().chars().all(|c| c.is_ascii_digit())
+            && message.starts_with("Some(\"")
+            && message.ends_with("\")")
+        {
+            let inner = &message[6..message.len() - 2];
+            if !inner.is_empty() && !inner.starts_with("Status code:") {
+                return inner.to_string();
+            }
+        }
+    }
     detail
 }
 
@@ -712,6 +727,16 @@ async fn handle_server_event(app: &AppHandle, state: &Arc<AppState>, event: Serv
                 return; // dropping target_tx fails the upload
             };
             let dest = state.destination.lock().unwrap().clone();
+            // The destination may have disappeared (deleted, unmounted volume,
+            // first run after a config restore); recreate it instead of failing
+            // every file of the session with "Failed to create ...".
+            if let Err(err) = std::fs::create_dir_all(&dest) {
+                emit_log(
+                    app,
+                    "receive",
+                    format!("无法创建保存目录 {}: {err}", dest.display()),
+                );
+            }
             let path = unique_path(&dest, &file.file_name);
             session
                 .saved_paths
@@ -1520,7 +1545,7 @@ pub async fn send_files(
                 FileSource::Path(p) => Some(p.display().to_string()),
                 FileSource::Bytes(_) => None,
                 #[cfg(target_os = "android")]
-                FileSource::ContentUri(_) => None,
+                FileSource::ContentUri(uri) => Some(uri.clone()),
             }),
         })
         .collect();
@@ -1803,41 +1828,59 @@ pub async fn copy_file_to(src: String, dst: String) -> Result<(), String> {
 
 /// Open a received file with the system default app.
 #[tauri::command]
-pub async fn open_file(path: String) -> Result<(), String> {
-    let p = PathBuf::from(&path);
-    if !p.exists() {
-        return Err("文件不存在".to_string());
+pub async fn open_file(app: AppHandle, path: String, mime_type: Option<String>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        android_command(&app, "openFile", serde_json::json!({ "path": path, "mimeType": mime_type })).await?;
+        return Ok(());
     }
-    open::that_detached(&p).map_err(|e| e.to_string())
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, mime_type);
+        let p = PathBuf::from(&path);
+        if !p.exists() {
+            return Err("文件不存在".to_string());
+        }
+        open::that_detached(&p).map_err(|e| e.to_string())
+    }
 }
 
 /// Read a local image file and return a data URL for inline preview.
 /// Only image/* files under ~20MB are served; anything else errors out.
 #[tauri::command]
-pub async fn read_image_preview(path: String) -> Result<String, String> {
-    const MAX_BYTES: u64 = 20 * 1024 * 1024;
-    let p = PathBuf::from(&path);
-    if !p.is_file() {
-        return Err("文件不存在".to_string());
+pub async fn read_image_preview(app: AppHandle, path: String) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        let result = android_command(&app, "readImagePreview", serde_json::json!({ "path": path })).await?;
+        return result["url"].as_str().map(str::to_owned).ok_or_else(|| "图片预览未返回内容".to_string());
     }
-    let mime = mime_guess::from_path(&p)
-        .first_raw()
-        .unwrap_or_default()
-        .to_string();
-    if !mime.starts_with("image/") {
-        return Err("不是图片文件".to_string());
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        const MAX_BYTES: u64 = 20 * 1024 * 1024;
+        let p = PathBuf::from(&path);
+        if !p.is_file() {
+            return Err("文件不存在".to_string());
+        }
+        let mime = mime_guess::from_path(&p)
+            .first_raw()
+            .unwrap_or_default()
+            .to_string();
+        if !mime.starts_with("image/") {
+            return Err("不是图片文件".to_string());
+        }
+        let meta = std::fs::metadata(&p).map_err(|e| e.to_string())?;
+        if meta.len() > MAX_BYTES {
+            return Err("图片过大,无法预览".to_string());
+        }
+        let bytes =
+            tokio::task::spawn_blocking(move || std::fs::read(p))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e: std::io::Error| e.to_string())?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Ok(format!("data:{mime};base64,{b64}"))
     }
-    let meta = std::fs::metadata(&p).map_err(|e| e.to_string())?;
-    if meta.len() > MAX_BYTES {
-        return Err("图片过大,无法预览".to_string());
-    }
-    let bytes =
-        tokio::task::spawn_blocking(move || std::fs::read(p))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e: std::io::Error| e.to_string())?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Ok(format!("data:{mime};base64,{b64}"))
 }
 
 /// Open a link in the default browser (本机打开,不中转).
@@ -1847,7 +1890,10 @@ pub async fn open_link(url: String) -> Result<(), String> {
     if !(u.starts_with("http://") || u.starts_with("https://")) {
         return Err("不是有效链接".to_string());
     }
-    open::that_detached(u).map_err(|e| e.to_string())
+    #[cfg(target_os = "android")]
+    { android_view_url(u.to_string()) }
+    #[cfg(not(target_os = "android"))]
+    { open::that_detached(u).map_err(|e| e.to_string()) }
 }
 
 /// Drag received files/folders (or a link) out of the window into Finder /
@@ -2012,10 +2058,66 @@ fn paste_file_paths_impl() -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows:Explorer 复制文件后剪贴板里是 CF_HDROP——一个 DROPFILES 结构
+/// 后跟双 NUL 结尾的宽字符路径列表。OpenClipboard 需要配合窗口的消息循环
+/// 重试;文件被拖动/占用时短暂拿不到,这里多试几次。
+#[cfg(target_os = "windows")]
 fn paste_file_paths_impl() -> Result<Vec<String>, String> {
-    // Windows/Linux: WebView2/gtk paste doesn't expose absolute file paths
-    // through DataTransfer either; add a native reader per-platform if needed.
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::Foundation::{HGLOBAL, HWND};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    };
+    use windows::Win32::System::Memory::GlobalSize;
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+    const CF_HDROP: u32 = 15;
+
+    unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP).is_err() {
+            return Ok(Vec::new());
+        }
+        let mut opened = false;
+        for _ in 0..5 {
+            if OpenClipboard(HWND::default()).is_ok() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !opened {
+            return Err("剪贴板被占用,请重试".to_string());
+        }
+        let result = (|| {
+            let handle = GetClipboardData(CF_HDROP).map_err(|e| e.to_string())?;
+            let hdrop = HDROP(handle.0 as _);
+            let count = DragQueryFileW(hdrop, u32::MAX, None);
+            let mut out = Vec::with_capacity(count as usize);
+            // GlobalSize 返回整个 DROPFILES+路径列表的字节数,宽字符缓冲按
+            // 一半预留足够上限(DragQueryFileW 只写实际路径长度)。
+            let cap = (GlobalSize(HGLOBAL(handle.0 as _)) / 2).max(260);
+            let mut buf = vec![0u16; cap];
+            for i in 0..count {
+                let len = DragQueryFileW(hdrop, i, Some(&mut buf));
+                if len == 0 {
+                    continue;
+                }
+                out.push(OsString::from_wide(&buf[..len as usize])
+                    .to_string_lossy()
+                    .into_owned());
+            }
+            Ok(out)
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn paste_file_paths_impl() -> Result<Vec<String>, String> {
+    // Linux: gtk paste doesn't expose absolute file paths through
+    // DataTransfer either; add a native reader if needed.
     Ok(Vec::new())
 }
 
@@ -2302,6 +2404,14 @@ struct PickResult {
 }
 
 #[cfg(target_os = "android")]
+async fn android_command(app: &AppHandle, cmd: &str, args: serde_json::Value) -> Result<serde_json::Value, String> {
+    app.state::<AndroidPicker<tauri::Wry>>().0
+        .run_mobile_plugin_async(cmd, args)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "android")]
 async fn android_pick(app: &AppHandle, cmd: &str) -> Result<Vec<AndroidPickItem>, String> {
     let picker = app.state::<AndroidPicker<tauri::Wry>>();
     let r: PickResult = picker
@@ -2342,6 +2452,30 @@ pub async fn pick_folder(app: AppHandle) -> Result<serde_json::Value, String> {
         let _ = app;
         Err("仅 Android 使用".to_string())
     }
+}
+
+#[tauri::command]
+pub async fn android_quick_send_state(app: AppHandle) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    { android_command(&app, "quickSendState", serde_json::json!({})).await }
+    #[cfg(not(target_os = "android"))]
+    { let _ = app; Err("仅 Android 使用".into()) }
+}
+
+#[tauri::command]
+pub async fn set_screenshot_suggestions(app: AppHandle, enabled: bool) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    { android_command(&app, "setScreenshotSuggestions", serde_json::json!({ "enabled": enabled })).await }
+    #[cfg(not(target_os = "android"))]
+    { let _ = (app, enabled); Err("仅 Android 使用".into()) }
+}
+
+#[tauri::command]
+pub async fn acknowledge_quick_send(app: AppHandle, id: Option<String>, uri: Option<String>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    { android_command(&app, "acknowledgeQuickSend", serde_json::json!({ "id": id, "uri": uri })).await?; Ok(()) }
+    #[cfg(not(target_os = "android"))]
+    { let _ = (app, id, uri); Err("仅 Android 使用".into()) }
 }
 
 /// "a: b: c" — reqwest's top-level message ("error sending request") hides the
@@ -2409,6 +2543,8 @@ pub async fn clear_history() -> Result<(), String> {
 // 先走 jsDelivr(国内可达),失败再走 raw.githubusercontent。
 
 const UPDATE_URLS: &[&str] = &[
+    "https://fastly.jsdelivr.net/gh/pan185618-cloud/kzj-transfer@main/update/latest.json",
+    "https://gcore.jsdelivr.net/gh/pan185618-cloud/kzj-transfer@main/update/latest.json",
     "https://cdn.jsdelivr.net/gh/pan185618-cloud/kzj-transfer@main/update/latest.json",
     "https://raw.githubusercontent.com/pan185618-cloud/kzj-transfer/main/update/latest.json",
 ];
@@ -2436,31 +2572,39 @@ fn version_tuple(v: &str) -> Vec<u64> {
 #[tauri::command]
 pub async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
     let current = app.package_info().version.to_string();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut last_err = String::new();
-    let mut manifest: Option<serde_json::Value> = None;
-    for url in UPDATE_URLS {
-        // jsDelivr 有缓存,带时间戳参数只对 raw 有用;两边都无害
-        let u = format!("{url}?t={}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() / 600)
-            .unwrap_or(0));
-        match client.get(&u).send().await {
-            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
-                Ok(v) => {
-                    manifest = Some(v);
-                    break;
-                }
-                Err(e) => last_err = e.to_string(),
-            },
-            Ok(r) => last_err = format!("HTTP {}", r.status()),
-            Err(e) => last_err = error_chain(&e),
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 600)
+        .unwrap_or(0);
+    let urls: Vec<String> = UPDATE_URLS.iter().map(|url| format!("{url}?t={stamp}")).collect();
+    #[cfg(target_os = "android")]
+    let m: serde_json::Value = {
+        let result = android_command(&app, "fetchUpdateManifest", serde_json::json!({ "urls": urls })).await?;
+        serde_json::from_str(result["json"].as_str().ok_or("更新清单为空")?).map_err(|e| e.to_string())?
+    };
+    #[cfg(not(target_os = "android"))]
+    let m = {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut last_err = String::new();
+        let mut manifest: Option<serde_json::Value> = None;
+        for url in urls {
+            match client.get(&url).send().await {
+                Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                    Ok(v) => {
+                        manifest = Some(v);
+                        break;
+                    }
+                    Err(e) => last_err = e.to_string(),
+                },
+                Ok(r) => last_err = format!("HTTP {}", r.status()),
+                Err(e) => last_err = error_chain(&e),
+            }
         }
-    }
-    let m = manifest.ok_or_else(|| format!("检查更新失败: {last_err}"))?;
+        manifest.ok_or_else(|| format!("检查更新失败: {last_err}"))?
+    };
     let latest = m["version"].as_str().unwrap_or("").to_string();
     if latest.is_empty() {
         return Err("更新清单缺少 version".to_string());
