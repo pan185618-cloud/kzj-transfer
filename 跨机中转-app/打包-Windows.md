@@ -14,6 +14,19 @@ git clone https://github.com/localsend/localsend.git app
 目录名必须是 `app`——`src-tauri/Cargo.toml` 通过
 `path = "../../app/packages/core"` 引用核心库。
 
+**然后必须打上本仓库携带的核心补丁**(上游不含,缺了接收失败就只报
+"500 Internal Server Error",看不到真实原因):
+
+```powershell
+cd app
+git checkout d01fdb1
+git apply ..\跨机中转-app\patches\0001-http-carry-save-failure-reason.patch
+cd ..
+```
+
+(或者直接解压 `分发包/kzjz-windows-源码包.zip`,里面已含打好补丁的
+`app/packages/core` 与全部 `跨机中转-app` 源码,覆盖到对应目录即可。)
+
 ## 1. 装构建环境(每台 Windows 机器一次)
 
 1. **Visual Studio Build Tools** — https://visualstudio.microsoft.com/zh-hans/downloads/

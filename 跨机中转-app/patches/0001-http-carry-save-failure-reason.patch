@@ -1,0 +1,158 @@
+From 5a7b21a9efe4d1ba2a47aae9780b6f06ee9bca46 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=BD=98=E5=B0=8F=E5=B3=B0?= <abc@MacBook-Air.local>
+Date: Sun, 15 Nov 2026 02:09:34 +0800
+Subject: [PATCH] fix(http): carry the save failure reason into the upload 500
+ response
+
+A failed save (missing/unwritable destination, aborted stream) answered
+uploads with a bare 500 whose body was only "Status code: 500 Internal
+Server Error", so senders could not tell why a transfer died. Return a
+DetailedSaveResult with the underlying reason, put it into the error
+response body, and keep forwarding it to the application's result
+channel.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ packages/core/src/http/server/common/save.rs | 18 +++++--
+ packages/core/src/http/server/v2.rs          | 11 ++--
+ packages/core/tests/v2_server.rs             | 56 ++++++++++++++++++++
+ 3 files changed, 78 insertions(+), 7 deletions(-)
+
+diff --git a/packages/core/src/http/server/common/save.rs b/packages/core/src/http/server/common/save.rs
+index b12645d..5315204 100644
+--- a/packages/core/src/http/server/common/save.rs
++++ b/packages/core/src/http/server/common/save.rs
+@@ -102,6 +102,16 @@ pub(crate) enum SaveResult {
+     HashMismatch,
+ }
+ 
++/// Outcome of receiving an uploaded file, including the reason for a failure
++/// so the upload endpoint can put it into the error response and the sender
++/// can show why the transfer failed.
++pub(crate) struct DetailedSaveResult {
++    pub result: SaveResult,
++
++    /// The failure reason; `None` on success.
++    pub error: Option<String>,
++}
++
+ /// Forwards the body of `req` to `target`.
+ pub(crate) async fn save_req_to_target(
+     req: Request<Incoming>,
+@@ -109,7 +119,7 @@ pub(crate) async fn save_req_to_target(
+     file_size: u64,
+     expected_sha256: Option<&str>,
+     timestamps: FileTimestamps,
+-) -> SaveResult {
++) -> DetailedSaveResult {
+     use sha2::{Digest, Sha256};
+ 
+     // Resolve the target into a chunk sender and a result receiver.
+@@ -237,13 +247,13 @@ pub(crate) async fn save_req_to_target(
+     };
+ 
+     if let Some(app_result_tx) = app_result_tx {
+-        let _ = app_result_tx.send(match error {
++        let _ = app_result_tx.send(match &error {
+             None => Ok(()),
+-            Some(err) => Err(err),
++            Some(err) => Err(err.to_string()),
+         });
+     }
+ 
+-    result
++    DetailedSaveResult { result, error }
+ }
+ 
+ /// Spawns a task that writes incoming chunks to a file provided by `open`.
+diff --git a/packages/core/src/http/server/v2.rs b/packages/core/src/http/server/v2.rs
+index 9d034a7..953e8b6 100644
+--- a/packages/core/src/http/server/v2.rs
++++ b/packages/core/src/http/server/v2.rs
+@@ -440,11 +440,16 @@ pub(crate) async fn upload(
+     )
+     .await;
+ 
+-    upload_guard.finish(result).await;
++    upload_guard.finish(result.result).await;
+ 
+-    match result {
++    match result.result {
+         SaveResult::Success => Ok(Response::new(empty_body())),
+-        SaveResult::Failed => Err(AppError::Status(StatusCode::INTERNAL_SERVER_ERROR)),
++        SaveResult::Failed => Err(AppError::Message(
++            StatusCode::INTERNAL_SERVER_ERROR,
++            result
++                .error
++                .unwrap_or_else(|| format!("Status code: {}", StatusCode::INTERNAL_SERVER_ERROR)),
++        )),
+         SaveResult::HashMismatch => Err(AppError::Message(
+             StatusCode::UNPROCESSABLE_ENTITY,
+             "Checksum mismatch".to_string(),
+diff --git a/packages/core/tests/v2_server.rs b/packages/core/tests/v2_server.rs
+index 4aa4cb7..e2ed042 100644
+--- a/packages/core/tests/v2_server.rs
++++ b/packages/core/tests/v2_server.rs
+@@ -1462,3 +1462,59 @@ async fn test_pin_too_many_attempts() {
+         .await;
+     assert_status(result, 429);
+ }
++
++/// A save target that cannot be opened (the save "directory" is a regular
++/// file) fails the upload with a 500 whose body carries the underlying
++/// reason, so the sender can show it instead of a bare status code.
++#[tokio::test]
++async fn test_upload_failure_reports_the_reason() {
++    let file = tokio::fs::File::create("test-upload-target-is-a-file")
++        .await
++        .unwrap();
++    drop(file);
++    let server = start_test_server(
++        None,
++        true,
++        Some(PathBuf::from("test-upload-target-is-a-file")),
++    )
++    .await;
++    let client = LsHttpClientV2::try_new_without_cert().unwrap();
++
++    let upload_file = file_dto("file-a", "a.bin", 5);
++    let response = client
++        .prepare_upload(
++            ProtocolType::Http,
++            "127.0.0.1",
++            server.port,
++            None,
++            prepare_upload_request(&[upload_file]),
++            None,
++            CancellationToken::new(),
++        )
++        .await
++        .unwrap()
++        .response
++        .unwrap();
++
++    let result = upload_bytes(
++        &client,
++        server.port,
++        &response.session_id,
++        "file-a",
++        &response.files["file-a"],
++        b"hello",
++    )
++    .await;
++
++    let Err(ClientError::StatusCode(err)) = result else {
++        panic!("expected a status code error, got {result:?}");
++    };
++    assert_eq!(err.status, 500);
++    let message = err.message.expect("the 500 must carry the failure reason");
++    assert!(
++        message.contains("Failed to create"),
++        "unexpected message: {message}"
++    );
++
++    let _ = tokio::fs::remove_file("test-upload-target-is-a-file").await;
++}
+-- 
+2.39.5 (Apple Git-154)
+

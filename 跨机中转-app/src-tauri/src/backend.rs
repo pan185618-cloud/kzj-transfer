@@ -277,6 +277,21 @@ fn reqwest_error_detail(err: &ClientError) -> String {
     if detail.contains("fingerprint mismatch") {
         detail.push_str("(对方设备指纹已变化,可能是重装或发现了同名的旧设备,请让对方重新在线)");
     }
+    // "500;Some(\"...\")" comes from StatusCodeError's "{status};{message:?}"
+    // display; when the receiver put a real reason into the body, show just
+    // that instead of the noise around it.
+    if let Some((status, message)) = detail.split_once(';') {
+        let message = message.trim();
+        if status.trim().chars().all(|c| c.is_ascii_digit())
+            && message.starts_with("Some(\"")
+            && message.ends_with("\")")
+        {
+            let inner = &message[6..message.len() - 2];
+            if !inner.is_empty() && !inner.starts_with("Status code:") {
+                return inner.to_string();
+            }
+        }
+    }
     detail
 }
 
@@ -712,6 +727,16 @@ async fn handle_server_event(app: &AppHandle, state: &Arc<AppState>, event: Serv
                 return; // dropping target_tx fails the upload
             };
             let dest = state.destination.lock().unwrap().clone();
+            // The destination may have disappeared (deleted, unmounted volume,
+            // first run after a config restore); recreate it instead of failing
+            // every file of the session with "Failed to create ...".
+            if let Err(err) = std::fs::create_dir_all(&dest) {
+                emit_log(
+                    app,
+                    "receive",
+                    format!("无法创建保存目录 {}: {err}", dest.display()),
+                );
+            }
             let path = unique_path(&dest, &file.file_name);
             session
                 .saved_paths
