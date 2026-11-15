@@ -1,0 +1,139 @@
+diff --git a/packages/core/src/http/server/common/save.rs b/packages/core/src/http/server/common/save.rs
+index 5315204..4eea195 100644
+--- a/packages/core/src/http/server/common/save.rs
++++ b/packages/core/src/http/server/common/save.rs
+@@ -126,7 +126,7 @@ pub(crate) async fn save_req_to_target(
+     // For [FileUploadTarget::Path] and [FileUploadTarget::Fd], the application's
+     // result channel is answered by this function once the complete outcome
+     // (including the checksum verification) is known.
+-    let (binary_tx, result_rx, app_result_tx) = match target {
++    let (binary_tx, mut result_rx, app_result_tx) = match target {
+         FileUploadTarget::Stream {
+             binary_tx,
+             result_rx,
+@@ -210,12 +210,19 @@ pub(crate) async fn save_req_to_target(
+         if stream_error {
+             // The file writer (if any) fails with a size mismatch or its own
+             // write error once the channel is closed; collect that reason.
+-            let error = match app_result_tx.is_some() {
+-                true => match result_rx.await {
++            let error = if app_result_tx.is_some() {
++                match result_rx.await {
+                     Ok(Err(err)) => Some(err),
+                     _ => None,
+-                },
+-                false => None,
++                }
++            } else {
++                // A stream consumer may already have supplied the reason it
++                // closed its chunk channel. Never wait for arbitrary consumers
++                // after a body error: they may not send a result at all.
++                match result_rx.try_recv() {
++                    Ok(Err(err)) => Some(err),
++                    _ => None,
++                }
+             };
+             break 'outcome (
+                 SaveResult::Failed,
+diff --git a/packages/core/src/http/server/v2.rs b/packages/core/src/http/server/v2.rs
+index 953e8b6..ecc52ac 100644
+--- a/packages/core/src/http/server/v2.rs
++++ b/packages/core/src/http/server/v2.rs
+@@ -423,12 +423,18 @@ pub(crate) async fn upload(
+     };
+     if v2.event_tx.send(event).await.is_err() {
+         upload_guard.finish(SaveResult::Failed).await;
+-        return Err(AppError::Status(StatusCode::INTERNAL_SERVER_ERROR));
++        return Err(AppError::Message(
++            StatusCode::INTERNAL_SERVER_ERROR,
++            "Receiver application stopped handling upload events".into(),
++        ));
+     }
+ 
+     let Ok(target) = target_rx.await else {
+         upload_guard.finish(SaveResult::Failed).await;
+-        return Err(AppError::Status(StatusCode::INTERNAL_SERVER_ERROR));
++        return Err(AppError::Message(
++            StatusCode::INTERNAL_SERVER_ERROR,
++            "Receiver application did not provide a save target (receive session missing or cancelled)".into(),
++        ));
+     };
+ 
+     let result = common::save::save_req_to_target(
+diff --git a/packages/core/tests/v2_server.rs b/packages/core/tests/v2_server.rs
+index e2ed042..65ae678 100644
+--- a/packages/core/tests/v2_server.rs
++++ b/packages/core/tests/v2_server.rs
+@@ -48,6 +48,17 @@ async fn start_test_server_with_verification(
+     accept: bool,
+     save_dir: Option<PathBuf>,
+     verify_checksums: bool,
++) -> TestServer {
++    start_test_server_with_target_mode(pin, accept, save_dir, verify_checksums, 0).await
++}
++
++// 0 = normal; 1 = application drops target; 2 = stream rejects with a reason.
++async fn start_test_server_with_target_mode(
++    pin: Option<String>,
++    accept: bool,
++    save_dir: Option<PathBuf>,
++    verify_checksums: bool,
++    target_mode: u8,
+ ) -> TestServer {
+     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+     let received: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+@@ -77,6 +88,18 @@ async fn start_test_server_with_verification(
+                     ServerEventV2::FileUpload {
+                         file_id, target_tx, ..
+                     } => {
++                        if target_mode == 1 {
++                            drop(target_tx);
++                            continue;
++                        }
++                        if target_mode == 2 {
++                            let (binary_tx, binary_rx) = mpsc::channel(1);
++                            drop(binary_rx);
++                            let (result_tx, result_rx) = oneshot::channel();
++                            let _ = result_tx.send(Err("receive session missing".into()));
++                            let _ = target_tx.send(FileUploadTarget::Stream { binary_tx, result_rx });
++                            continue;
++                        }
+                         let received = received.clone();
+                         match &save_dir {
+                             None => {
+@@ -1463,6 +1486,35 @@ async fn test_pin_too_many_attempts() {
+     assert_status(result, 429);
+ }
+ 
++#[tokio::test]
++async fn test_missing_upload_target_reports_application_failure() {
++    assert_application_target_failure(1, "did not provide a save target").await;
++}
++
++#[tokio::test]
++async fn test_closed_stream_preserves_application_failure() {
++    assert_application_target_failure(2, "receive session missing").await;
++}
++
++async fn assert_application_target_failure(mode: u8, expected: &str) {
++    let server = start_test_server_with_target_mode(None, true, None, true, mode).await;
++    let client = LsHttpClientV2::try_new_without_cert().unwrap();
++    let response = client.prepare_upload(
++        ProtocolType::Http, "127.0.0.1", server.port, None,
++        prepare_upload_request(&[file_dto("file-a", "a.bin", 5)]),
++        None, CancellationToken::new(),
++    ).await.unwrap().response.unwrap();
++    let result = upload_bytes(
++        &client, server.port, &response.session_id,
++        "file-a", &response.files["file-a"], b"hello",
++    ).await;
++    let Err(ClientError::StatusCode(err)) = result else {
++        panic!("expected status error, got {result:?}");
++    };
++    assert_eq!(err.status, 500);
++    assert!(err.message.as_deref().unwrap_or("").contains(expected), "{err:?}");
++}
++
+ /// A save target that cannot be opened (the save "directory" is a regular
+ /// file) fails the upload with a 500 whose body carries the underlying
+ /// reason, so the sender can show it instead of a bare status code.

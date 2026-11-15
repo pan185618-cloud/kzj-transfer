@@ -3,6 +3,10 @@
 //! events for the UI.
 
 use crate::events::*;
+
+#[cfg(test)]
+#[path = "receive_tests.rs"]
+mod receive_tests;
 use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -217,6 +221,23 @@ impl ReceiveSession {
     }
 }
 
+/// Publish the app's receive state before waking the HTTP prepare handler.
+/// The upload can arrive on another runtime thread as soon as Accept is sent.
+async fn accept_receive_session(
+    receive: &AsyncMutex<Option<ReceiveSession>>,
+    session: ReceiveSession,
+    decision_tx: oneshot::Sender<PrepareUploadDecisionV2>,
+) -> Result<(), String> {
+    let ids = session.files.keys().cloned().collect();
+    let mut guard = receive.lock().await;
+    let previous = guard.replace(session);
+    if decision_tx.send(PrepareUploadDecisionV2::Accept(ids)).is_err() {
+        *guard = previous;
+        return Err("请求已失效".into());
+    }
+    Ok(())
+}
+
 struct SendTask {
     send_id: String,
     alias: String,
@@ -258,6 +279,15 @@ pub struct AppState {
 /// "error sending request for url" — the real reason
 /// (证书指纹不匹配 / 连接被拒 / 超时) sits in the source chain.
 fn reqwest_error_detail(err: &ClientError) -> String {
+    if let ClientError::StatusCode(status) = err {
+        if let Some(message) = status.message.as_ref().filter(|m| {
+            !m.is_empty() && !m.starts_with("Status code:")
+        }) {
+            // Read the typed field: Display debug-escapes Windows backslashes
+            // and quotes, so slicing its formatted text corrupts paths.
+            return message.clone();
+        }
+    }
     // Walk the chain so the TLS reject reason buried under
     // "error sending request" reaches the user.
     let mut detail = err.to_string();
@@ -277,21 +307,6 @@ fn reqwest_error_detail(err: &ClientError) -> String {
     if detail.contains("fingerprint mismatch") {
         detail.push_str("(对方设备指纹已变化,可能是重装或发现了同名的旧设备,请让对方重新在线)");
     }
-    // "500;Some(\"...\")" comes from StatusCodeError's "{status};{message:?}"
-    // display; when the receiver put a real reason into the body, show just
-    // that instead of the noise around it.
-    if let Some((status, message)) = detail.split_once(';') {
-        let message = message.trim();
-        if status.trim().chars().all(|c| c.is_ascii_digit())
-            && message.starts_with("Some(\"")
-            && message.ends_with("\")")
-        {
-            let inner = &message[6..message.len() - 2];
-            if !inner.is_empty() && !inner.starts_with("Status code:") {
-                return inner.to_string();
-            }
-        }
-    }
     detail
 }
 
@@ -303,6 +318,22 @@ fn now_ms() -> u64 {
 }
 
 fn emit_log(app: &AppHandle, category: &str, text: String) {
+    // Receive failures otherwise vanish with a short-lived toast on Windows.
+    // Keep only operational events, never transferred text or credentials.
+    if matches!(category, "receive" | "error" | "system") {
+        use std::io::Write;
+        let dir = config_dir();
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let path = dir.join("receive.log");
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1024 * 1024) {
+                let _ = std::fs::rename(&path, dir.join("receive.previous.log"));
+            }
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let line = text.replace(['\r', '\n'], " ");
+                let _ = writeln!(file, "{} [{category}] {line}", now_ms());
+            }
+        }
+    }
     let _ = app.emit(
         EVT_LOG,
         LogPayload {
@@ -520,7 +551,10 @@ async fn start_inner(app: AppHandle) -> anyhow::Result<()> {
     });
     app.manage(state.clone());
 
-    emit_log(&app, "system", format!("已启动,设备名: {}", state.identity.alias));
+    emit_log(&app, "system", format!(
+        "已启动,版本: {} (receive-fix-1),设备名: {}",
+        app.package_info().version, state.identity.alias,
+    ));
     emit_devices(&app, &state.discovery, &state.paired);
 
     // Announce ourselves and probe paired/known peers, then refresh the list.
@@ -654,26 +688,22 @@ async fn handle_server_event(app: &AppHandle, state: &Arc<AppState>, event: Serv
 
             // Auto-accept paired devices.
             if state.paired.lock().unwrap().contains(&sender.fingerprint) {
-                let ids: HashSet<String> = files.keys().cloned().collect();
-                if decision_tx
-                    .send(PrepareUploadDecisionV2::Accept(ids))
-                    .is_ok()
-                {
-                    let total = files.values().map(|f| f.size).sum();
-                    *state.receive.lock().await = Some(ReceiveSession {
-                        session_id: session_id.clone(),
-                        alias: info.alias.clone(),
-                        sender,
-                        files,
-                        saved_paths: HashMap::new(),
-                        total_bytes: total,
-                        finished_files: 0,
-                        failed_files: 0,
-                        finalized_bytes: 0,
-                        in_progress: HashMap::new(),
-                        started: Instant::now(),
-                        ended: None,
-                    });
+                let total = files.values().map(|f| f.size).sum();
+                let session = ReceiveSession {
+                    session_id: session_id.clone(),
+                    alias: info.alias.clone(),
+                    sender,
+                    files,
+                    saved_paths: HashMap::new(),
+                    total_bytes: total,
+                    finished_files: 0,
+                    failed_files: 0,
+                    finalized_bytes: 0,
+                    in_progress: HashMap::new(),
+                    started: Instant::now(),
+                    ended: None,
+                };
+                if accept_receive_session(&state.receive, session, decision_tx).await.is_ok() {
                     emit_log(app, "receive", format!("{} 开始自动接收(已配对)", info.alias));
                 }
                 return;
@@ -724,7 +754,19 @@ async fn handle_server_event(app: &AppHandle, state: &Arc<AppState>, event: Serv
                 .as_mut()
                 .filter(|s| s.session_id == session_id)
             else {
-                return; // dropping target_tx fails the upload
+                let reason = format!(
+                    "接收失败: {} 的上传没有匹配的接收会话 (session={session_id})",
+                    file.file_name,
+                );
+                emit_log(app, "receive", reason.clone());
+                // Supply an explicit failure rather than dropping the target
+                // and reducing the error to a generic HTTP 500.
+                let (binary_tx, binary_rx) = mpsc::channel(1);
+                drop(binary_rx);
+                let (result_tx, result_rx) = oneshot::channel();
+                let _ = result_tx.send(Err(reason));
+                let _ = target_tx.send(FileUploadTarget::Stream { binary_tx, result_rx });
+                return;
             };
             let dest = state.destination.lock().unwrap().clone();
             // The destination may have disappeared (deleted, unmounted volume,
@@ -1677,16 +1719,8 @@ pub async fn answer_receive(
         emit_log(&app, "receive", format!("{}: 已配对,以后自动接收", pending.alias));
         emit_devices(&app, &state.discovery, &state.paired);
     }
-    let ids: HashSet<String> = pending.files.keys().cloned().collect();
-    if pending
-        .decision_tx
-        .send(PrepareUploadDecisionV2::Accept(ids))
-        .is_err()
-    {
-        return Err("请求已失效".to_string());
-    }
     let total = pending.files.values().map(|f| f.size).sum();
-    *state.receive.lock().await = Some(ReceiveSession {
+    let session = ReceiveSession {
         session_id: pending.session_id.clone(),
         alias: pending.alias.clone(),
         sender: pending.sender,
@@ -1699,7 +1733,8 @@ pub async fn answer_receive(
         in_progress: HashMap::new(),
         started: Instant::now(),
         ended: None,
-    });
+    };
+    accept_receive_session(&state.receive, session, pending.decision_tx).await?;
     emit_log(&app, "receive", format!("{}: 开始接收", pending.alias));
     Ok(())
 }

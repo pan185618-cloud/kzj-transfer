@@ -21,6 +21,7 @@ git clone https://github.com/localsend/localsend.git app
 cd app
 git checkout d01fdb1
 git apply ..\跨机中转-app\patches\0001-http-carry-save-failure-reason.patch
+git apply ..\跨机中转-app\patches\0002-receive-target-diagnostics.patch
 cd ..
 ```
 
