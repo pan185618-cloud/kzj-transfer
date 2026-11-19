@@ -207,7 +207,56 @@ struct ReceiveSession {
     finalized_bytes: u64,
     in_progress: HashMap<String, Arc<AtomicU64>>,
     started: Instant,
+    /// Last time this session saw transfer activity. A sender that dies mid-file
+    /// may never send SessionEnd, so an idle session must not block the next one.
+    last_activity: Instant,
     ended: Option<SessionEndReasonV2>,
+}
+
+/// A receive session with no transfer activity for this long is abandoned.
+/// Only consulted when a new prepare-upload arrives, so it never interrupts a
+/// transfer that is actually making progress.
+const RECEIVE_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn receive_session_is_stale(session: &ReceiveSession, now: Instant) -> bool {
+    now.saturating_duration_since(session.last_activity) > RECEIVE_SESSION_IDLE_TIMEOUT
+}
+
+/// Frees the core's single upload slot when its sender disappeared mid-file.
+/// The core answers new prepare-uploads with 409 until the slot is released,
+/// and it never hands that event to the app, so this has to poll by itself.
+async fn reap_stale_receive_loop(app: AppHandle, state: Arc<AppState>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(15));
+    loop {
+        ticker.tick().await;
+        let stale = {
+            let mut guard = state.receive.lock().await;
+            let Some(sid) = guard
+                .as_ref()
+                .filter(|s| receive_session_is_stale(s, Instant::now()))
+                .map(|s| s.session_id.clone())
+            else {
+                continue;
+            };
+            if !state.server.cancel_v2_session(&sid).await {
+                continue;
+            }
+            guard.take();
+            sid
+        };
+        emit_log(&app, "receive", format!("清理超时的接收会话 {stale}"));
+    }
+}
+
+async fn clear_stale_receive(receive: &AsyncMutex<Option<ReceiveSession>>) -> Option<String> {
+    let mut guard = receive.lock().await;
+    if guard
+        .as_ref()
+        .is_some_and(|s| receive_session_is_stale(s, Instant::now()))
+    {
+        return guard.take().map(|s| s.session_id);
+    }
+    None
 }
 
 impl ReceiveSession {
@@ -550,9 +599,10 @@ async fn start_inner(app: AppHandle) -> anyhow::Result<()> {
         paired: Mutex::new(paired),
     });
     app.manage(state.clone());
+    tokio::spawn(reap_stale_receive_loop(app.clone(), state.clone()));
 
     emit_log(&app, "system", format!(
-        "已启动,版本: {} (receive-fix-1),设备名: {}",
+        "已启动,版本: {} (receive-fix-2),设备名: {}",
         app.package_info().version, state.identity.alias,
     ));
     emit_devices(&app, &state.discovery, &state.paired);
@@ -657,6 +707,15 @@ async fn handle_server_event(app: &AppHandle, state: &Arc<AppState>, event: Serv
             files,
             decision_tx,
         } => {
+            // A transfer that broke off may never deliver SessionEnd; otherwise
+            // its session would answer every new prepare-upload with 409 forever.
+            if let Some(stale) = clear_stale_receive(&state.receive).await {
+                emit_log(
+                    app,
+                    "receive",
+                    format!("清理超时的接收会话 {stale}"),
+                );
+            }
             // The sender is clearly reachable; feed it into the store.
             device_confirmed(state, ip.to_string(), info.clone()).await;
             emit_devices(app, &state.discovery, &state.paired);
@@ -701,6 +760,7 @@ async fn handle_server_event(app: &AppHandle, state: &Arc<AppState>, event: Serv
                     finalized_bytes: 0,
                     in_progress: HashMap::new(),
                     started: Instant::now(),
+                    last_activity: Instant::now(),
                     ended: None,
                 };
                 if accept_receive_session(&state.receive, session, decision_tx).await.is_ok() {
@@ -768,6 +828,7 @@ async fn handle_server_event(app: &AppHandle, state: &Arc<AppState>, event: Serv
                 let _ = target_tx.send(FileUploadTarget::Stream { binary_tx, result_rx });
                 return;
             };
+            session.last_activity = Instant::now();
             let dest = state.destination.lock().unwrap().clone();
             // The destination may have disappeared (deleted, unmounted volume,
             // first run after a config restore); recreate it instead of failing
@@ -806,6 +867,7 @@ async fn handle_server_event(app: &AppHandle, state: &Arc<AppState>, event: Serv
                     .as_mut()
                     .filter(|s| s.session_id == session_id)
                 {
+                    session.last_activity = Instant::now();
                     session.in_progress.remove(&file_id);
                     match &result {
                         Ok(()) => {
@@ -868,8 +930,9 @@ async fn handle_server_event(app: &AppHandle, state: &Arc<AppState>, event: Serv
 }
 
 async fn emit_receive_progress(app: &AppHandle, state: &Arc<AppState>, session_id: &str) {
-    let guard = state.receive.lock().await;
-    if let Some(s) = guard.as_ref().filter(|s| s.session_id == session_id) {
+    let mut guard = state.receive.lock().await;
+    if let Some(s) = guard.as_mut().filter(|s| s.session_id == session_id) {
+        s.last_activity = Instant::now();
         let elapsed = s.started.elapsed().as_secs_f64().max(0.01);
         let _ = app.emit(
             EVT_RECEIVE_PROGRESS,
@@ -1732,6 +1795,7 @@ pub async fn answer_receive(
         finalized_bytes: 0,
         in_progress: HashMap::new(),
         started: Instant::now(),
+        last_activity: Instant::now(),
         ended: None,
     };
     accept_receive_session(&state.receive, session, pending.decision_tx).await?;

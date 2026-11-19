@@ -18,6 +18,7 @@ fn session(id: &str) -> ReceiveSession {
         finalized_bytes: 0,
         in_progress: HashMap::new(),
         started: Instant::now(),
+        last_activity: Instant::now(),
         ended: None,
     }
 }
@@ -43,6 +44,28 @@ async fn expired_acceptance_restores_previous_session() {
     drop(rx);
     assert!(accept_receive_session(&receive, session("expired"), tx).await.is_err());
     assert_eq!(receive.lock().await.as_ref().unwrap().session_id, "previous");
+}
+
+#[test]
+fn idle_session_becomes_stale_after_timeout() {
+    let mut s = session("old");
+    s.last_activity = Instant::now() - RECEIVE_SESSION_IDLE_TIMEOUT - Duration::from_secs(1);
+    assert!(receive_session_is_stale(&s, Instant::now()));
+}
+
+#[test]
+fn recently_active_session_is_not_stale() {
+    let s = session("active");
+    assert!(!receive_session_is_stale(&s, Instant::now()));
+}
+
+#[tokio::test]
+async fn stale_session_is_cleared_before_a_new_upload() {
+    let mut s = session("old");
+    s.last_activity = Instant::now() - RECEIVE_SESSION_IDLE_TIMEOUT - Duration::from_secs(1);
+    let receive = AsyncMutex::new(Some(s));
+    assert_eq!(clear_stale_receive(&receive).await.as_deref(), Some("old"));
+    assert!(receive.lock().await.is_none());
 }
 
 #[test]
